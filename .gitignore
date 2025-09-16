@@ -1,0 +1,62 @@
+# ── Laravel log files ───────────────────────────────────────────────────────
+*.log
+
+# ── macOS and Windows system files ─────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Environment variable overrides & backups (never commit) ────────────────
+.env.local
+.env.backup
+.env.production
+
+# ── Composer auth file ─────────────────────────────────────────────────────
+auth.json
+
+# ── Node modules ───────────────────────────────────────────────────────────
+node_modules/
+
+# ── Front-end build artifacts ──────────────────────────────────────────────
+public/build/
+public/hot/
+
+# ── Laravel storage & cache (covers src/public/storage & src/storage/…) ────
+public/storage/
+storage/*.key
+storage/pail/
+
+# ── PHP dependencies ───────────────────────────────────────────────────────
+vendor/
+
+# ── IDE / Editor settings ─────────────────────────────────────────────────
+.idea/
+.vscode/
+.phpactor.json
+.phpunit.cache
+.phpunit.result.cache
+.fleet/
+.nova/
+.zed/
+
+# ── Homestead files ───────────────────────────────────────────────────────
+Homestead.json
+Homestead.yaml
+
+# ── Dev-only Docker override ───────────────────────────────────────────────
+docker-compose.override.yml
+
+# envs (Laravel app is in src/)
+.env
+src/.env
+
+# TLS keys/certs
+*.pem
+*.pfx
+*.key
+id_rsa
+id_rsa.*
+
+# Let’s Encrypt working dirs
+docker/certbot/etc/
+docker/certbot/lib/
+docker/certbot/www/src/.env

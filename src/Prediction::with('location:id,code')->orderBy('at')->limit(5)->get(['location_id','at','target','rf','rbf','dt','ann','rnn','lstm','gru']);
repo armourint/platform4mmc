@@ -1,0 +1,85 @@
+[90m= [39m[34;4mIlluminate\Database\Eloquent\Collection[39;24m {#6323
+    [34mall[39m: [
+      [34;4mApp\Models\Prediction[39;24m {#6351
+        [34mlocation_id[39m: [35m9[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6352
+        [34mlocation_id[39m: [35m20[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6353
+        [34mlocation_id[39m: [35m10[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6354
+        [34mlocation_id[39m: [35m11[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6355
+        [34mlocation_id[39m: [35m1[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6356
+        [34mlocation_id[39m: [35m12[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6357
+        [34mlocation_id[39m: [35m2[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6358
+        [34mlocation_id[39m: [35m13[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6359
+        [34mlocation_id[39m: [35m3[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6360
+        [34mlocation_id[39m: [35m14[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6361
+        [34mlocation_id[39m: [35m4[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6362
+        [34mlocation_id[39m: [35m15[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6363
+        [34mlocation_id[39m: [35m5[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6364
+        [34mlocation_id[39m: [35m16[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6365
+        [34mlocation_id[39m: [35m6[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6366
+        [34mlocation_id[39m: [35m17[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6367
+        [34mlocation_id[39m: [35m7[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6368
+        [34mlocation_id[39m: [35m18[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6369
+        [34mlocation_id[39m: [35m8[39m,
+        [34mc[39m: [35m2[39m,
+      },
+      [34;4mApp\Models\Prediction[39;24m {#6370
+        [34mlocation_id[39m: [35m19[39m,
+        [34mc[39m: [35m2[39m,
+      },
+    ],
+  }
+

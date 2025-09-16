@@ -1,0 +1,1 @@
+@extends('layouts.admin') @section('content') <h2>Hindcasting & Accuracy</h2> @endsection

@@ -1,0 +1,91 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+    html {
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+    }
+
+    body {
+        @apply bg-slate-50 text-ink-800;
+    }
+
+    h1,
+    h2,
+    h3 {
+        @apply text-ink-900;
+    }
+}
+
+@layer components {
+    .btn {
+        @apply inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium shadow-sm transition;
+    }
+
+    .btn-primary {
+        @apply btn bg-brand text-white hover:bg-brand-600;
+    }
+
+    .btn-ghost {
+        @apply btn bg-white hover:bg-slate-50 border border-slate-200;
+    }
+
+    .card {
+        @apply bg-white rounded-2xl shadow-soft;
+    }
+
+    .card-header {
+        @apply px-5 pt-5 pb-2 text-sm font-semibold text-ink-700;
+    }
+
+    .card-body {
+        @apply px-5 pb-5;
+    }
+
+    .chip {
+        @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium;
+    }
+
+    .chip-green {
+        @apply chip bg-green-100 text-green-700;
+    }
+
+    .chip-amber {
+        @apply chip bg-amber-100 text-amber-800;
+    }
+
+    .chip-red {
+        @apply chip bg-red-100 text-red-700;
+    }
+
+    .field {
+        @apply space-y-1;
+    }
+
+    .label {
+        @apply text-xs font-medium text-ink-600;
+    }
+
+    .input,
+    .select {
+        @apply w-full rounded-xl border-slate-200 focus:border-brand focus:ring-brand/40;
+    }
+
+    .table {
+        @apply w-full text-sm;
+    }
+
+    .thead {
+        @apply text-xs uppercase tracking-wide text-ink-500;
+    }
+
+    .tbody tr {
+        @apply border-t border-slate-100;
+    }
+
+    .num {
+        @apply text-right tabular-nums;
+    }
+}

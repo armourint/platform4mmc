@@ -1,0 +1,15 @@
+name: stopfloods
+services:
+  nginx:
+    # Bind-mount your built code so /var/www/html/public/images exists
+    volumes:
+      - ./src:/var/www/html:ro
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./docker/certbot/etc:/etc/letsencrypt:ro
+      - ./docker/certbot/lib:/var/lib/letsencrypt:rw
+      - ./docker/certbot/www:/var/www/certbot:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - app

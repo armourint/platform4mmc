@@ -1,0 +1,1 @@
+@extends('layouts.admin') @section('content') <h2>Tides & Sensors</h2> @endsection
