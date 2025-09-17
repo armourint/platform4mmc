@@ -76,19 +76,16 @@ services:
 
   node:
     image: node:20-alpine
-    working_dir: /var/www/html          
+    working_dir: /var/www/html
     volumes:
-      - ./src:/var/www/html:delegated   
+      - ./src:/var/www/html:delegated
       - node_modules:/var/www/html/node_modules
     ports:
       - "5173:5173"
     environment:
       CHOKIDAR_USEPOLLING: "true"
       VITE_HOST: "0.0.0.0"
-    # command: sh -lc "npm install && npm run dev -- --host"  # optional
-
-
- 
+    command: sh -lc "npm install && npm run dev -- --host"  # optional
 
 volumes:
   dbdata:

@@ -18,8 +18,12 @@ class Index extends Component
             ->get();
     }
 
-    public function render()
+  public function render()
     {
-        return view('livewire.projects.index');
+        $projects = \App\Models\Project::where('owner_id', \Auth::id())->latest()->get();
+
+        return view('livewire.projects.index', compact('projects'))
+            ->layout('layouts.app', ['header' => 'Projects']);
     }
+
 }
