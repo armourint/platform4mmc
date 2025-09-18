@@ -9,16 +9,24 @@ use App\Models\Assessment;
 class Hub extends Component
 {
     public Project $project;
-    public $assessmentsByType;
 
     public function mount(Project $project)
     {
-        $this->project = $project->load(['assessments']);
-        $this->assessmentsByType = $this->project->assessments->groupBy('type');
+        $this->project = $project;
     }
 
     public function render()
     {
-        return view('livewire.assessments.hub');
+        // Load this project's assessments (if any)
+        $assessments = Assessment::where('project_id', $this->project->id)
+            ->latest()
+            ->get();
+
+        return view('livewire.assessments.hub', [
+                'assessments' => $assessments,
+            ])
+            ->layout('layouts.app', [
+                'header' => 'Assessments: ' . $this->project->name,
+            ]);
     }
 }

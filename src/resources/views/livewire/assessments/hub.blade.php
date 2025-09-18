@@ -1,31 +1,51 @@
-<x-app-layout>
-    <x-slot name="header">
-        <h2 class="text-xl font-semibold">{{ $project->name }} — Assessments</h2>
-    </x-slot>
-
-    <div class="p-6 grid gap-4 md:grid-cols-2">
-        {{-- Viability --}}
+<div class="p-6">
+    <div class="grid gap-6 md:grid-cols-2">
         <div class="rounded-lg border bg-white p-6">
-            <div class="flex items-center justify-between mb-2">
-                <div class="font-medium">Viability</div>
-                @if(($assessmentsByType['viability'] ?? collect())->isNotEmpty())
-                    <a href="{{ route('assessments.results', $assessmentsByType['viability']->last()) }}" class="text-sm text-indigo-600 hover:underline">Last result</a>
-                @endif
+            <h3 class="text-lg font-semibold mb-3">Run a New Assessment</h3>
+            <p class="text-sm text-gray-600 mb-4">
+                Choose which Decision Support Tool to run for <span class="font-medium">{{ $project->name }}</span>.
+            </p>
+            <div class="flex flex-col gap-2">
+                <a href="{{ route('assessments.viability', $project) }}"
+                   class="inline-flex items-center justify-center px-4 py-2 rounded-md bg-indigo-600 text-white hover:bg-indigo-700">
+                    Start Viability Assessment
+                </a>
+                <a href="{{ route('assessments.environmental', $project) }}"
+                   class="inline-flex items-center justify-center px-4 py-2 rounded-md bg-emerald-600 text-white hover:bg-emerald-700">
+                    Start Environmental Assessment
+                </a>
             </div>
-            <p class="text-sm text-gray-600 mb-4">Check which MMC systems are viable for your site constraints.</p>
-            <a href="{{ route('assessments.viability', $project) }}" class="px-3 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700">Start / Continue</a>
         </div>
 
-        {{-- Environmental --}}
         <div class="rounded-lg border bg-white p-6">
-            <div class="flex items-center justify-between mb-2">
-                <div class="font-medium">Environmental</div>
-                @if(($assessmentsByType['environmental'] ?? collect())->isNotEmpty())
-                    <a href="{{ route('assessments.results', $assessmentsByType['environmental']->last()) }}" class="text-sm text-indigo-600 hover:underline">Last result</a>
-                @endif
-            </div>
-            <p class="text-sm text-gray-600 mb-4">Enter A1–A3 / A4–A5 / C1–C4 etc. to view KPIs.</p>
-            <a href="{{ route('assessments.environmental', $project) }}" class="px-3 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700">Start / Continue</a>
+            <h3 class="text-lg font-semibold mb-3">Recent Assessments</h3>
+
+            @if($assessments->isEmpty())
+                <div class="rounded-md border border-dashed p-6 text-gray-500 text-center">
+                    No assessments yet for this project.
+                </div>
+            @else
+                <ul class="divide-y">
+                    @foreach($assessments as $a)
+                        <li class="py-3 flex items-center justify-between">
+                            <div>
+                                <div class="font-medium">{{ ucfirst($a->type) }} assessment</div>
+                                <div class="text-sm text-gray-500">{{ $a->created_at->format('M j, Y H:i') }}</div>
+                            </div>
+                            <a class="text-indigo-600 hover:underline"
+                               href="{{ route('assessments.results', $a) }}">
+                                View results
+                            </a>
+                        </li>
+                    @endforeach
+                </ul>
+            @endif
         </div>
     </div>
-</x-app-layout>
+
+    <div class="mt-6">
+        <a href="{{ route('projects.index') }}" class="text-gray-600 hover:text-gray-800 hover:underline">
+            ← Back to Projects
+        </a>
+    </div>
+</div>

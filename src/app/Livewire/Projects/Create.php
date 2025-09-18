@@ -31,7 +31,7 @@ class Create extends Component
         ]);
 
         return redirect()->route('assessments.hub', $project)
-            ->with('status','Project created');
+            ->with('status', 'Project created');
     }
 
     public function render()

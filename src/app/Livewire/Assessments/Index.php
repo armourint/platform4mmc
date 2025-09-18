@@ -13,6 +13,6 @@ class Index extends Component
         $projects = Project::where('owner_id', Auth::id())->latest()->get();
 
         return view('livewire.assessments.index', compact('projects'))
-        ->layout('layouts.app');
+            ->layout('layouts.app', ['header' => 'Assessments']);
     }
 }
