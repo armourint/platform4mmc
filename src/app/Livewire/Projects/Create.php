@@ -2,41 +2,45 @@
 
 namespace App\Livewire\Projects;
 
-use Livewire\Component;
 use App\Models\Project;
-use Illuminate\Support\Facades\Auth;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
 
+#[Layout('layouts.app')]
 class Create extends Component
 {
-    public $name;
-    public $client;
-    public $location;
+    public string $name = '';
+    public ?string $client = null;
+    public ?string $location = null;
+    public ?string $user_role = null;
 
-    protected $rules = [
-        'name' => ['required','string','max:255'],
-        'client' => ['nullable','string','max:255'],
-        'location' => ['nullable','string','max:255'],
-    ];
-
-    public function save()
+    protected function rules(): array
     {
-        $this->validate();
+        return [
+            'name'      => ['required','string','max:255'],
+            'client'    => ['nullable','string','max:255'],
+            'location'  => ['nullable','string','max:255'],
+            'user_role' => ['nullable','string','max:255'],
+        ];
+    }
+
+    public function save(): void
+    {
+        $data = $this->validate();
 
         $project = Project::create([
-            'owner_id' => Auth::id(),
-            'name' => $this->name,
-            'client' => $this->client,
-            'location' => $this->location,
-            'meta' => [],
+            'owner_id' => auth()->id(),
+            'name'     => $data['name'],
+            'client'   => $data['client'] ?? null,
+            'location' => $data['location'] ?? null,
+            'meta'     => ['user_role' => $data['user_role'] ?? null],
         ]);
 
-        return redirect()->route('assessments.hub', $project)
-            ->with('status', 'Project created');
+        $this->redirectRoute('assessments.hub', $project);
     }
 
     public function render()
     {
-        return view('livewire.projects.create')
-            ->layout('layouts.app', ['header' => 'Create Project']);
+        return view('livewire.projects.create');
     }
 }

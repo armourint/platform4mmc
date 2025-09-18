@@ -1,26 +1,33 @@
-<div class="p-6 max-w-3xl">
-    <div class="rounded-lg border p-6 bg-white">
-        <form wire:submit.prevent="save" class="grid gap-4">
-            <div>
-                <label class="block text-sm font-medium mb-1">Project Name</label>
-                <input wire:model.defer="name" class="w-full rounded-md border-gray-300">
-                @error('name') <div class="text-sm text-red-600 mt-1">{{ $message }}</div> @enderror
-            </div>
-            <div>
-                <label class="block text-sm font-medium mb-1">Client</label>
-                <input wire:model.defer="client" class="w-full rounded-md border-gray-300">
-                @error('client') <div class="text-sm text-red-600 mt-1">{{ $message }}</div> @enderror
-            </div>
-            <div>
-                <label class="block text-sm font-medium mb-1">Location</label>
-                <input wire:model.defer="location" class="w-full rounded-md border-gray-300">
-                @error('location') <div class="text-sm text-red-600 mt-1">{{ $message }}</div> @enderror
-            </div>
+<div class="mx-auto max-w-3xl">
+  <h1 class="mb-6 text-2xl font-semibold">Project Information</h1>
 
-            <div class="mt-4 flex gap-2">
-                <button class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700">Save</button>
-                <a href="{{ route('projects.index') }}" class="px-4 py-2 rounded-md border">Cancel</a>
-            </div>
-        </form>
+  <form wire:submit.prevent="save" class="space-y-4 rounded-xl border bg-white p-6">
+    <div>
+      <label class="block text-sm font-medium">Project Name <span class="text-red-600">*</span></label>
+      <input type="text" wire:model.defer="name" class="mt-1 w-full rounded border px-3 py-2">
+      @error('name') <div class="mt-1 text-sm text-red-600">{{ $message }}</div> @enderror
     </div>
+
+    <div>
+      <label class="block text-sm font-medium">Location</label>
+      <input type="text" wire:model.defer="location" class="mt-1 w-full rounded border px-3 py-2">
+      @error('location') <div class="mt-1 text-sm text-red-600">{{ $message }}</div> @enderror
+    </div>
+
+    <div>
+      <label class="block text-sm font-medium">Client</label>
+      <input type="text" wire:model.defer="client" class="mt-1 w-full rounded border px-3 py-2">
+      @error('client') <div class="mt-1 text-sm text-red-600">{{ $message }}</div> @enderror
+    </div>
+
+    <div>
+      <label class="block text-sm font-medium">Your Role in the Project</label>
+      <input type="text" wire:model.defer="user_role" class="mt-1 w-full rounded border px-3 py-2" placeholder="e.g., Project Manager, Architect">
+      @error('user_role') <div class="mt-1 text-sm text-red-600">{{ $message }}</div> @enderror
+    </div>
+
+    <div class="pt-2">
+      <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-white hover:bg-blue-700">Save Project</button>
+    </div>
+  </form>
 </div>

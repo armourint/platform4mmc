@@ -10,6 +10,7 @@ use App\Livewire\Assessments\ViabilityWizard;
 use App\Livewire\Assessments\EnvironmentalForm;
 use App\Livewire\Assessments\Results;
 use App\Livewire\Knowledge\Index as KnowledgeIndex;
+use App\Http\Controllers\Admin\DatasetController;
 
 // Home → login or projects
 Route::get('/', fn () => redirect()->route(auth()->check() ? 'projects.index' : 'login'));
@@ -37,4 +38,18 @@ Route::middleware(['auth'])->group(function () {
     // Index pages for nav
     Route::get('/assessments', AssessmentsIndex::class)->name('assessments.index');
     Route::get('/knowledge',   KnowledgeIndex::class)->name('knowledge.index');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Admin routes (datasets management)
+| Requires the 'admin' middleware alias (role=admin)
+|--------------------------------------------------------------------------
+*/
+Route::middleware(['auth', 'admin'])->prefix('admin')->group(function () {
+    Route::get('/datasets', [DatasetController::class, 'index'])->name('admin.datasets');
+    Route::post('/datasets/create', [DatasetController::class, 'create'])->name('admin.datasets.create');
+    Route::post('/datasets/{dataset}/publish', [DatasetController::class, 'publish'])->name('admin.datasets.publish');
+    Route::post('/datasets/{dataset}/archive', [DatasetController::class, 'archive'])->name('admin.datasets.archive');
+    Route::post('/datasets/{dataset}/import-rules', [DatasetController::class, 'importRules'])->name('admin.datasets.importRules');
 });

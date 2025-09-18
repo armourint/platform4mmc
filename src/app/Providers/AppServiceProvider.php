@@ -2,23 +2,21 @@
 
 namespace App\Providers;
 
-use Illuminate\Support\ServiceProvider;
+use App\Models\Assessment;
+use App\Models\Project;
+use App\Policies\AssessmentPolicy;
+use App\Policies\ProjectPolicy;
+use Illuminate\Foundation\Support\Providers\AuthServiceProvider as ServiceProvider;
 
-class AppServiceProvider extends ServiceProvider
+class AuthServiceProvider extends ServiceProvider
 {
-    /**
-     * Register any application services.
-     */
-    public function register(): void
-    {
-        //
-    }
+    protected $policies = [
+        Project::class    => ProjectPolicy::class,
+        Assessment::class => AssessmentPolicy::class,
+    ];
 
-    /**
-     * Bootstrap any application services.
-     */
     public function boot(): void
     {
-        //
+        $this->registerPolicies();
     }
 }
