@@ -14,6 +14,7 @@ services:
       - mysql
     volumes:
       - ./src:/var/www/html:cached
+      - ./data:/mnt/data:cached
     expose:
       - "9000"
 
