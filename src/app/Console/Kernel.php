@@ -17,8 +17,10 @@ class Kernel extends ConsoleKernel
         \App\Console\Commands\ImportEnvironmentalLayersFromExcel::class,
         \App\Console\Commands\ImportEnvironmentalA4FromExcel::class,
         \App\Console\Commands\ImportIrelandCounties::class,
+        \App\Console\Commands\ImportManufacturersFromExcel::class,
+        \App\Console\Commands\ImportEpdProductsFromExcel::class,
 
-
+        
 
         \App\Console\Commands\ImportEnvWallsFromExcel::class,
         \App\Console\Commands\ImportEnvCladdingFromExcel::class,
