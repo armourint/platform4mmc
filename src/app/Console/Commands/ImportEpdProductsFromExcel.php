@@ -1,213 +1,255 @@
 <?php
 
-// app/Console/Commands/ImportEpdProductsFromExcel.php
 namespace App\Console\Commands;
 
-use App\Models\Product;
+use App\Models\EpdProduct;
+use App\Models\ProductEpdMetric;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Maatwebsite\Excel\Facades\Excel;
 
-class ImportEpdProductsFromExcel extends Command
+class ImportEPDProductsFromExcel extends Command
 {
     protected $signature = 'mmc:import-products
-        {--path= : Path to EPD workbook}
-        {--sheet= : Sheet name (optional; default first)}
-        {--reset : Truncate products table first}
-    ';
-    protected $description = 'Import EPD products from spreadsheet into products table.';
+        {--path= : Path to the EPD Excel file}
+        {--sheet= : Sheet name (default: first sheet)}
+        {--reset : Truncate epd_products and product_epd_metrics before import}
+        {--dry : Parse only; don\'t write}';
+
+    protected $description = 'Import EPD product catalog (epd_products + product_epd_metrics)';
 
     public function handle(): int
     {
-        if ($this->option('reset')) {
-            $this->resetProducts();
-        }
-        
         $path = $this->option('path');
-        if (!$path || !is_file($path)) { $this->error('Provide a valid --path'); return self::FAILURE; }
-
-        if ($this->option('reset')) { Product::truncate(); $this->warn('Reset: truncated products table.'); }
-
-        $sheets = Excel::toArray(null, $path);
-        $rows = $sheets[0] ?? [];
-        if ($this->option('sheet')) {
-            // Best-effort: Excel::toArray() doesn’t expose names; assume first is correct for now
+        if (!$path || !is_file($path)) {
+            $this->error('File not found: ' . ($path ?: '(none)'));
+            return self::FAILURE;
         }
-        if (empty($rows)) { $this->error('No rows found.'); return self::FAILURE; }
 
-        $header = array_map([$this,'norm'], array_shift($rows));
-        $idx = [];
-        foreach ($header as $i=>$h) { if ($h!=='') $idx[$h]=$i; }
-
-        $map = $this->columnMap();
-
-        $ins=0; $upd=0;
-        DB::transaction(function() use($rows,$idx,$map,&$ins,&$upd){
-            foreach ($rows as $r) {
-                if (!count(array_filter($r, fn($v)=>trim((string)$v)!==''))) continue;
-
-                [$payload,$extras] = $this->buildPayload($r,$idx,$map);
-
-                // identity for upsert
-                $unique = [
-                    'epd_number'   => $payload['epd_number'] ?? null,
-                    'manufacturer' => $payload['manufacturer'] ?? null,
-                    'product_name' => $payload['product_name'] ?? null,
-                ];
-                if (!$unique['epd_number'] && !($unique['manufacturer'] && $unique['product_name'])) continue;
-
-                $q = Product::query();
-                if ($unique['epd_number']) $q->orWhere('epd_number',$unique['epd_number']);
-                if ($unique['manufacturer'] && $unique['product_name']) {
-                    $q->orWhere(fn($qq)=>$qq->where('manufacturer',$unique['manufacturer'])
-                                            ->where('product_name',$unique['product_name']));
+        // Optional reset (IMPORTANT: metrics first, then products due to FK)
+        if ($this->option('reset')) {
+            DB::beginTransaction();
+            try {
+                if (Schema::hasTable('product_epd_metrics')) {
+                    DB::statement('TRUNCATE TABLE product_epd_metrics');
                 }
-                $existing = $q->first();
+                if (Schema::hasTable('epd_products')) {
+                    DB::statement('TRUNCATE TABLE epd_products');
+                }
+                DB::commit();
+                $this->info('Reset complete: truncated product_epd_metrics and epd_products.');
+            } catch (\Throwable $e) {
+                DB::rollBack();
+                $this->warn('Reset failed gracefully; falling back to delete cascade… '.$e->getMessage());
+                ProductEpdMetric::query()->delete();
+                EpdProduct::query()->delete();
+                $this->info('Reset via delete() complete.');
+            }
+        }
 
-                if (!empty($extras)) $payload['extras'] = array_merge($existing?->extras ?? [], $extras);
+        // Load the workbook
+        $sheets = Excel::toArray(null, $path);
+        if (empty($sheets)) {
+            $this->error('No sheets found in workbook.');
+            return self::FAILURE;
+        }
 
-                if ($existing) { $existing->fill($payload)->save(); $upd++; }
-                else { Product::create($payload); $ins++; }
+        $sheetName = $this->option('sheet');
+        $active = $sheets[0];
+        if ($sheetName !== null) {
+            foreach ($sheets as $candidate) {
+                // maatwebsite returns only arrays, so we just pick the first with non-empty header
+                if (is_array($candidate) && !empty($candidate)) {
+                    $active = $candidate;
+                    break;
+                }
+            }
+        }
+
+        if (count($active) < 2) {
+            $this->warn('Sheet has no data rows.');
+            return self::SUCCESS;
+        }
+
+        // Normalize headers
+        $rawHeader = array_map(fn($h) => is_string($h) ? trim($h) : (string)$h, $active[0]);
+        $headerMap = [];
+        foreach ($rawHeader as $i => $label) {
+            $key = strtolower(preg_replace('/\s+/', ' ', str_replace(['–','—','  '], ['-','-',' '], $label)));
+            $headerMap[$key] = $i;
+        }
+
+        // handy getter
+        $get = function(array $row, string $label) use ($headerMap) {
+            $k = strtolower($label);
+            return array_key_exists($k, $headerMap) ? ($row[$headerMap[$k]] ?? null) : null;
+        };
+
+        // column aliases (based on the CSV of column titles you shared)
+        $aliases = [
+            'uuid'                              => 'uuid',
+            'country code'                      => 'country_code',
+            'country'                           => 'country',
+            'product category'                  => 'category',
+            'product subcategory'               => 'subcategory',
+            'product owner'                     => 'owner',
+            'product name'                      => 'name',
+            'epd registration authority'        => 'reg_auth',
+            'registration number'               => 'reg_number',
+            'reference year'                    => 'reference_year',
+            'valid until'                       => 'valid_until',
+
+            'technology description'            => 'technology_description',
+            'technical purpose'                 => 'technical_purpose',
+            'general comment'                   => 'general_comment',
+            'use advice'                        => 'use_advice',
+            'lca methodology report'            => 'lca_methodology_report',
+            'data quality management'           => 'data_quality_management',
+            'type of review'                    => 'type_of_review',
+
+            'mass per du [kg]'                  => 'mass_per_du_kg',
+            'weight per m2 [kg]'                => 'weight_per_m2_kg',
+            'product thickness [m]'             => 'thickness_m',
+            'product length [m]'                => 'length_m',
+            'product width [m]'                 => 'width_m',
+            'product height [m]'                => 'height_m',
+            'area [m²]'                         => 'area_m2',
+            'volume [m³]'                       => 'volume_m3',
+            'specific surface [m²/kg]'          => 'specific_surface_m2_per_kg',
+            'density [kg/m3]'                   => 'density_kg_m3',
+            'thermal conductivity [w/mk]'       => 'thermal_conductivity_w_mk',
+            'thermal resistance, r [m²k/w]'     => 'thermal_resistance_m2k_w',
+            'density [kg/litre]'                => 'density_kg_litre',
+            'coverage [m² per litre]'           => 'coverage_m2_per_litre',
+
+            'declared amount'                   => 'declared_amount',
+            'resulting amount'                  => 'resulting_amount',
+            'reference property'                => 'reference_property',
+            'reference unit'                    => 'reference_unit',
+            'category unit'                     => 'category_unit',
+
+            // GWP summary fields
+            'global warming potential (gwp) [kg co2e] - a1-a3 (per category unit)' => 'gwp_a1a3_catunit',
+            'global warming potential (gwp) [kg co2e] - a1-a3 (sum)'               => 'gwp_a1a3_sum',
+            'global warming potential (gwp) [kg co2e] - a1'                        => 'gwp_a1',
+            'global warming potential (gwp) [kg co2e] - a2'                        => 'gwp_a2',
+            'global warming potential (gwp) [kg co2e] - a3'                        => 'gwp_a3',
+
+            'global warming potential - total (gwp-total) [kg co2e] - a1'          => 'gwp_total_a1',
+            'global warming potential - total (gwp-total) [kg co2e] - a2'          => 'gwp_total_a2',
+            'global warming potential - total (gwp-total) [kg co2e] - a3'          => 'gwp_total_a3',
+
+            'global warming potential - land use and land use change (gwp-luluc) [kg co2e] - a1' => 'gwp_luluc_a1',
+            'global warming potential - land use and land use change (gwp-luluc) [kg co2e] - a2' => 'gwp_luluc_a2',
+            'global warming potential - land use and land use change (gwp-luluc) [kg co2e] - a3' => 'gwp_luluc_a3',
+            'global warming potential - land use and land use change (gwp-luluc) [kg co2e] - a1-a3 (sum)' => 'gwp_luluc_a1a3_sum',
+
+            'global warming potential - biogenic (gwp-biogenic) [kg co2e] - a1'    => 'gwp_biogenic_a1',
+            'global warming potential - biogenic (gwp-biogenic) [kg co2e] - a2'    => 'gwp_biogenic_a2',
+            'global warming potential - biogenic (gwp-biogenic) [kg co2e] - a3'    => 'gwp_biogenic_a3',
+            'global warming potential - biogenic (gwp-biogenic) [kg co2e] - a1-a3 (sum)' => 'gwp_biogenic_a1a3_sum',
+
+            'global warming potential - fossil fuels (gwp-fossil) [kg co2e] - a1'  => 'gwp_fossil_a1',
+            'global warming potential - fossil fuels (gwp-fossil) [kg co2e] - a2'  => 'gwp_fossil_a2',
+            'global warming potential - fossil fuels (gwp-fossil) [kg co2e] - a3'  => 'gwp_fossil_a3',
+            'global warming potential - fossil fuels (gwp-fossil) [kg co2e] - a1-a3 (sum)' => 'gwp_fossil_a1a3_sum',
+        ];
+
+        $rows = array_slice($active, 1);
+        $created = 0;
+
+        DB::transaction(function () use ($rows, $aliases, $get, &$created) {
+            foreach ($rows as $r) {
+                // Skip totally empty lines
+                if (!is_array($r) || count(array_filter($r, fn($v) => $v !== null && $v !== '')) === 0) {
+                    continue;
+                }
+
+                // Build payload for epd_products
+                $payload = [];
+                foreach ($aliases as $header => $field) {
+                    $val = $get($r, $header);
+                    if ($val === '' || $val === null) {
+                        $payload[$field] = null;
+                        continue;
+                    }
+                    // Cast some numeric-ish fields
+                    if (preg_match('/^(mass_|weight_|thickness_|length_|width_|height_|area_|volume_|specific_surface_|density_|thermal_|coverage_|declared_amount|resulting_amount|gwp_)/', $field)) {
+                        $payload[$field] = is_numeric($val) ? (float)$val : (float)str_replace([','], [''], (string)$val);
+                    } elseif (in_array($field, ['reference_year'])) {
+                        $payload[$field] = is_numeric($val) ? (int)$val : null;
+                    } elseif ($field === 'valid_until') {
+                        // accept yyyy-mm-dd or dd/mm/yyyy etc.
+                        try {
+                            $payload[$field] = date('Y-m-d', strtotime((string)$val));
+                        } catch (\Throwable $e) {
+                            $payload[$field] = null;
+                        }
+                    } else {
+                        $payload[$field] = is_string($val) ? trim($val) : $val;
+                    }
+                }
+
+                // Must have a minimal identity to store (owner+name or reg_number)
+                if (empty($payload['name']) && empty($payload['reg_number'])) {
+                    continue;
+                }
+
+                /** @var EpdProduct $product */
+                $product = EpdProduct::create($payload);
+                $created++;
+
+                // Optional metrics (populate if present)
+                $metricDefs = [
+                    // module => [ indicator => header-key ]
+                    'A1'    => [
+                        'GWP-total'  => 'global warming potential - total (gwp-total) [kg co2e] - a1',
+                        'GWP-luluc'  => 'global warming potential - land use and land use change (gwp-luluc) [kg co2e] - a1',
+                        'GWP-biogenic'=> 'global warming potential - biogenic (gwp-biogenic) [kg co2e] - a1',
+                        'GWP-fossil' => 'global warming potential - fossil fuels (gwp-fossil) [kg co2e] - a1',
+                    ],
+                    'A2'    => [
+                        'GWP-total'  => 'global warming potential - total (gwp-total) [kg co2e] - a2',
+                        'GWP-luluc'  => 'global warming potential - land use and land use change (gwp-luluc) [kg co2e] - a2',
+                        'GWP-biogenic'=> 'global warming potential - biogenic (gwp-biogenic) [kg co2e] - a2',
+                        'GWP-fossil' => 'global warming potential - fossil fuels (gwp-fossil) [kg co2e] - a2',
+                    ],
+                    'A3'    => [
+                        'GWP-total'  => 'global warming potential - total (gwp-total) [kg co2e] - a3',
+                        'GWP-luluc'  => 'global warming potential - land use and land use change (gwp-luluc) [kg co2e] - a3',
+                        'GWP-biogenic'=> 'global warming potential - biogenic (gwp-biogenic) [kg co2e] - a3',
+                        'GWP-fossil' => 'global warming potential - fossil fuels (gwp-fossil) [kg co2e] - a3',
+                    ],
+                    'A1-A3' => [
+                        'GWP'        => 'global warming potential (gwp) [kg co2e] - a1-a3 (sum)',
+                        'GWP per CU' => 'global warming potential (gwp) [kg co2e] - a1-a3 (per category unit)',
+                        'GWP-luluc'  => 'global warming potential - land use and land use change (gwp-luluc) [kg co2e] - a1-a3 (sum)',
+                        'GWP-biogenic'=> 'global warming potential - biogenic (gwp-biogenic) [kg co2e] - a1-a3 (sum)',
+                        'GWP-fossil' => 'global warming potential - fossil fuels (gwp-fossil) [kg co2e] - a1-a3 (sum)',
+                    ],
+                ];
+
+                foreach ($metricDefs as $module => $indicators) {
+                    foreach ($indicators as $indicator => $hdr) {
+                        $v = $get($r, $hdr);
+                        if ($v === '' || $v === null) continue;
+                        $num = is_numeric($v) ? (float)$v : (float)str_replace([','], [''], (string)$v);
+                        ProductEpdMetric::updateOrCreate(
+                            [
+                                'product_id' => $product->id,
+                                'module'     => $module,
+                                'indicator'  => $indicator,
+                                'unit'       => $payload['category_unit'] ?? null,
+                            ],
+                            ['value' => $num]
+                        );
+                    }
+                }
             }
         });
 
-        $this->info("Products upserted. Inserted: $ins, Updated: $upd");
+        $this->info("Imported {$created} product(s) into epd_products.");
         return self::SUCCESS;
     }
-
-    private function norm(?string $s): string
-    {
-        $s = strtolower((string)$s);
-        $s = str_replace(["\u{2013}","\u{2014}"], '-', $s); // – —
-        $s = str_replace(['co₂e','co?e'], 'co2e', $s);
-        $s = str_replace(['(',')','[',']','{','}','/','\\','.'], ' ', $s);
-        $s = preg_replace('/[^a-z0-9\-\s_]/', ' ', $s); // strip odd glyphs
-        $s = preg_replace('/\s+/', ' ', $s);
-        return trim(str_replace(' ', '_', $s));
-    }
-
-    private function columnMap(): array
-    {
-        return [
-            // identity & taxonomy
-            'uuid'                         => 'uuid',
-            'country_code'                 => 'country_code',
-            'country'                      => 'country',
-            'product_category'             => 'category',
-            'product_subcategory'          => 'subcategory',
-            'product_owner'                => 'manufacturer',
-            'product_name'                 => 'product_name',
-
-            // program / meta
-            'epd_registration_authority'   => 'epd_program',
-            'registration_number'          => 'epd_number',
-            'reference_year'               => 'reference_year',
-            'valid_until'                  => 'valid_to',
-
-            // units & amounts
-            'reference_property'           => 'reference_property',
-            'reference_unit'               => 'reference_unit',
-            'category_unit'                => 'category_unit',
-            'declared_amount'              => 'declared_amount',
-            'resulting_amount'             => 'resulting_amount',
-
-            // geometry & properties (meters as provided)
-            'mass_per_du_kg'               => 'mass_per_du_kg',
-            'weight_per_m2_kg'             => 'weight_per_m2_kg',
-            'product_thickness_m'          => 'thickness_m',
-            'product_length_m'             => 'length_m',
-            'product_width_m'              => 'width_m',
-            'product_height_m'             => 'height_m',
-            'area_m2'                      => 'area_m2',
-            'volume_m3'                    => 'volume_m3',
-            'specific_surface_m2_kg'       => 'specific_surface_m2_per_kg',
-            'density_kg_m3'                => 'density_kg_m3',
-            'thermal_conductivity_w_mk'    => 'thermal_conductivity_w_mk',
-            'thermal_resistance_r_m2k_w'   => 'thermal_resistance_m2k_w',
-            'density_kg_litre'             => 'density_kg_litre',
-            'coverage_m2_per_litre'        => 'coverage_m2_per_litre',
-
-            // LCA: A1–A3 per category unit & sum
-            'global_warming_potential_gwp_kg_co2e_-_a1-a3_per_category_unit' => 'a1a3_per_declared_unit',
-            'global_warming_potential_gwp_kg_co2e_-_a1-a3_sum'               => 'a1a3_sum',
-
-            // A1/A2/A3 basic
-            'global_warming_potential_gwp_kg_co2e_-_a1' => 'gwp_a1',
-            'global_warming_potential_gwp_kg_co2e_-_a2' => 'gwp_a2',
-            'global_warming_potential_gwp_kg_co2e_-_a3' => 'gwp_a3',
-
-            // A1/A2/A3 total
-            'global_warming_potential_-_total_gwp-total_kg_co2e_-_a1' => 'gwp_total_a1',
-            'global_warming_potential_-_total_gwp-total_kg_co2e_-_a2' => 'gwp_total_a2',
-            'global_warming_potential_-_total_gwp-total_kg_co2e_-_a3' => 'gwp_total_a3',
-
-            // LULUC
-            'global_warming_potential_-_land_use_and_land_use_change_gwp-luluc_kg_co2e_-_a1'      => 'gwp_luluc_a1',
-            'global_warming_potential_-_land_use_and_land_use_change_gwp-luluc_kg_co2e_-_a2'      => 'gwp_luluc_a2',
-            'global_warming_potential_-_land_use_and_land_use_change_gwp-luluc_kg_co2e_-_a3'      => 'gwp_luluc_a3',
-            'global_warming_potential_-_land_use_and_land_use_change_gwp-luluc_kg_co2e_-_a1-a3_sum' => 'gwp_luluc_a1a3_sum',
-
-            // Biogenic
-            'global_warming_potential_-_biogenic_gwp-biogenic_kg_co2e_-_a1'      => 'gwp_biogenic_a1',
-            'global_warming_potential_-_biogenic_gwp-biogenic_kg_co2e_-_a2'      => 'gwp_biogenic_a2',
-            'global_warming_potential_-_biogenic_gwp-biogenic_kg_co2e_-_a3'      => 'gwp_biogenic_a3',
-            'global_warming_potential_-_biogenic_gwp-biogenic_kg_co2e_-_a1-a3_sum' => 'gwp_biogenic_a1a3_sum',
-
-            // Fossil
-            'global_warming_potential_-_fossil_fuels_gwp-fossil_kg_co2e_-_a1'      => 'gwp_fossil_a1',
-            'global_warming_potential_-_fossil_fuels_gwp-fossil_kg_co2e_-_a2'      => 'gwp_fossil_a2',
-            'global_warming_potential_-_fossil_fuels_gwp-fossil_kg_co2e_-_a3'      => 'gwp_fossil_a3',
-            'global_warming_potential_-_fossil_fuels_gwp-fossil_kg_co2e_-_a1-a3_sum' => 'gwp_fossil_a1a3_sum',
-        ];
-    }
-
-    private function buildPayload(array $r, array $idx, array $map): array
-    {
-        $p=[]; $extras=[];
-        $num = fn($x)=>($x===null||$x==='')?null:(is_numeric(str_replace([',',' '],'',(string)$x))?(float)str_replace([',',' '],'',(string)$x):null);
-        $int = fn($x)=>($x===null||$x==='')?null:(int)$num($x);
-        $date= fn($x)=>($x?optional(\Carbon\Carbon::parse($x))->toDateString():null);
-
-        foreach ($map as $from=>$to) {
-            if (!array_key_exists($from,$idx)) continue;
-            $raw = $r[$idx[$from]] ?? null;
-            if ($raw===null || $raw==='') continue;
-
-            // choose coercion based on target
-            if (str_contains($to,'_date'))          $val=$date($raw);
-            elseif (in_array($to, ['valid_to']))     $val=$date($raw);
-            elseif (in_array($to, ['reference_year'])) $val=$int($raw);
-            elseif (is_string($raw) && preg_match('/^\s*[\d,.\s-]+\s*$/', (string)$raw)) $val=$num($raw);
-            else                                     $val=is_string($raw)?trim($raw):$raw;
-
-            $p[$to]=$val;
-        }
-
-        // stash remaining columns into extras
-        foreach ($idx as $col=>$i) {
-            if (!array_key_exists($col,$map)) {
-                $val=$r[$i]??null;
-                if ($val!==null && $val!=='') $extras[$col]=$val;
-            }
-        }
-
-        return [$p,$extras];
-    }
-
-    protected function resetProducts(): void
-    {
-        // IMPORTANT: truncate children first, then parents
-        DB::statement('SET FOREIGN_KEY_CHECKS=0');
-
-        // add any other child tables that reference products here
-        DB::table('product_epd_metrics')->truncate();
-
-        // now it's safe to truncate products
-        DB::table('products')->truncate();
-
-        DB::statement('SET FOREIGN_KEY_CHECKS=1');
-
-        $this->info('Reset: truncated products and product_epd_metrics');
-    }
 }
-
