@@ -10,7 +10,17 @@ use App\Livewire\Assessments\ViabilityWizard;
 use App\Livewire\Assessments\EnvironmentalForm;
 use App\Livewire\Assessments\Results;
 use App\Livewire\Knowledge\Index as KnowledgeIndex;
-use App\Http\Controllers\Admin\DatasetController;
+
+use App\Livewire\Admin\Imports;
+use App\Http\Controllers\Admin\DataImportController;
+
+// Admin Livewire pages
+use App\Livewire\Admin\EnvLayersTable;
+use App\Livewire\Admin\RulesTable;
+use App\Livewire\Admin\ManufacturersTable;
+use App\Livewire\Admin\ManufacturersMap;
+// use App\Livewire\Admin\ProductsTable;
+// use App\Livewire\Admin\Imports;
 
 // Home → login or projects
 Route::get('/', fn () => redirect()->route(auth()->check() ? 'projects.index' : 'login'));
@@ -42,14 +52,27 @@ Route::middleware(['auth'])->group(function () {
 
 /*
 |--------------------------------------------------------------------------
-| Admin routes (datasets management)
-| Requires the 'admin' middleware alias (role=admin)
+| Admin routes (landing + new admin screens)
 |--------------------------------------------------------------------------
 */
-Route::middleware(['auth', 'admin'])->prefix('admin')->group(function () {
-    Route::get('/datasets', [DatasetController::class, 'index'])->name('admin.datasets');
-    Route::post('/datasets/create', [DatasetController::class, 'create'])->name('admin.datasets.create');
-    Route::post('/datasets/{dataset}/publish', [DatasetController::class, 'publish'])->name('admin.datasets.publish');
-    Route::post('/datasets/{dataset}/archive', [DatasetController::class, 'archive'])->name('admin.datasets.archive');
-    Route::post('/datasets/{dataset}/import-rules', [DatasetController::class, 'importRules'])->name('admin.datasets.importRules');
-});
+Route::middleware(['auth', 'admin'])
+    ->prefix('admin')
+    ->name('admin.')
+    ->group(function () {
+        // Admin landing (Overview)
+        Route::view('/', 'admin.index')->name('index');
+
+        // New Admin screens
+        Route::get('/layers', EnvLayersTable::class)->name('layers');
+        Route::get('/rules', RulesTable::class)->name('rules');
+        Route::get('/manufacturers', ManufacturersTable::class)->name('manufacturers');
+        Route::get('/manufacturers/map', ManufacturersMap::class)->name('manufacturers.map');
+
+        Route::get('/imports', Imports::class)->name('imports');
+        Route::get('/imports/{import}/download', [DataImportController::class, 'download'])
+            ->name('imports.download')
+            ->whereNumber('import');
+
+        // (Optional legacy) redirect old datasets UI to landing
+        Route::redirect('/datasets', '/admin')->name('datasets.legacy');
+    });

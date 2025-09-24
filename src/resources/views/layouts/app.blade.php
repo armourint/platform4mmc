@@ -25,7 +25,7 @@
                     <a href="{{ route('assessments.index') }}">Assessments</a>
                     <a href="{{ route('knowledge.index') }}">Knowledge</a>
                     @if(auth()->user()->role === 'admin')
-                        <a href="{{ route('admin.datasets') }}">Admin</a>
+                        <a href="{{ route('admin.index') }}">Admin</a>
                     @endif
                 @endauth
             </nav>

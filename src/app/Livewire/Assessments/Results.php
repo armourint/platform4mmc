@@ -2,28 +2,35 @@
 
 namespace App\Livewire\Assessments;
 
-use Livewire\Component;
 use App\Models\Assessment;
+use App\Services\Assessments\ResultsService;
+use Livewire\Attributes\Layout;
+use Livewire\Component;
 
+#[Layout('layouts.app')] // ⬅️ fix here
 class Results extends Component
 {
     public Assessment $assessment;
 
-    public function mount(Assessment $assessment)
+    public ?string $systemCode = null;
+    public array $viability = [];
+    public array $env = [];
+
+    public function mount(Assessment $assessment): void
     {
-        $this->assessment = $assessment->load('project');
+        $this->assessment = $assessment;
+        $this->systemCode = ResultsService::resolveSystemCode($assessment);
+        $this->refreshResults();
+    }
+
+    public function refreshResults(): void
+    {
+        $this->viability = ResultsService::viabilitySummary($this->systemCode);
+        $this->env       = ResultsService::environmentalSnapshot($this->systemCode);
     }
 
     public function render()
     {
-        // You will plug in real scoring here; for now, read $assessment->results or show placeholder.
-        $results = $this->assessment->results;
-
-        return view('livewire.assessments.results', [
-                'results' => $results,
-            ])
-            ->layout('layouts.app', [
-                'header' => 'Results — ' . ucfirst($this->assessment->type) . ' · ' . $this->assessment->project->name,
-            ]);
+        return view('livewire.assessments.results');
     }
 }

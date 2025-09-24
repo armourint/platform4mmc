@@ -11,10 +11,10 @@ services:
     env_file:
       - ./.env
     depends_on:
-      - mysql
+      mysql:
+        condition: service_healthy
     volumes:
       - ./src:/var/www/html:cached
-      - ./data:/mnt/data:cached
     expose:
       - "9000"
 
@@ -43,11 +43,35 @@ services:
       MYSQL_USER: ${DB_USERNAME}
       MYSQL_PASSWORD: ${DB_PASSWORD}
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --sql-mode=ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
     ports:
       - "${MYSQL_HOST_PORT}:3306"
     volumes:
-      - dbdata:/var/lib/mysql
+      - dbdata80:/var/lib/mysql          # <— NEW volume for MySQL 8.0
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${DB_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
+  mysql57:
+    image: mysql:5.7
+    container_name: mysql57
+    environment:
+      MYSQL_DATABASE: ${DB_DATABASE}
+      MYSQL_USER: ${DB_USERNAME}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    volumes:
+      - dbdata:/var/lib/mysql           # <-- old 5.7 data
+    ports:
+      - "33061:3306"                    # avoid clash with 8.0 on 33060/3306
+    
+    
   certbot:
     image: certbot/certbot
     env_file:
@@ -89,5 +113,7 @@ services:
     command: sh -lc "npm install && npm run dev -- --host"  # optional
 
 volumes:
-  dbdata:
+  dbdata: {}     # old 5.7 data (unchanged, for rollback)
+  dbdata80: {}   # new 8.0 data
   node_modules:
+
