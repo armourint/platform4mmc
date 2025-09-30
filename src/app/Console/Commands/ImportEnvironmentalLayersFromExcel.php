@@ -2,327 +2,448 @@
 
 namespace App\Console\Commands;
 
+use App\Models\DataImport;
 use App\Models\DatasetVersion;
-use App\Models\EnvironmentalFactor;
-use App\Models\EnvironmentalLayer;
 use Illuminate\Console\Command;
-use Illuminate\Support\Arr;
-use Illuminate\Support\Str;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use PhpOffice\PhpSpreadsheet\IOFactory;
 
 class ImportEnvironmentalLayersFromExcel extends Command
 {
-    protected $signature = 'mmc:import-env-layers
-        {--path= : Path to ireland_generic_mmc_model.xlsx}
-        {--sheet= : Sheet name. e.g. "Wall Systems", "Cladding Systems", "Slab Systems"}
-        {--dataset-version= : Dataset version label (e.g. v2025.09)}
-        {--reset : Delete existing rows for this dataset/sheet category before import}
-        {--dump=0 : Preview first N parsed rows without writing (0 = disabled)}
-        {--header-row=1 : Header row number (1-based)}
-    ';
+    protected $signature = 'mmc:import-environmental-layers
+        {--import-id= : Use a DataImport row (takes precedence over other options)}
+        {--path= : Absolute path to the Excel workbook}
+        {--dataset-version= : DatasetVersion ID or label to attach to}
+        {--dataset-version-id= : Reuse this dataset_versions.id (never create another)}
+        {--reset : Truncate existing rows for this dataset_version before import}
+        {--sheet : Sheet name (default: na)}';
 
-    protected $description = 'Import layered A1–A3 data (per system) from the Excel sheets into environmental_layers (+ aggregate A1–A3 factors).';
+    protected $description = 'Import Environmental layers from the MMC workbook into environmental_layers (no schema changes)';
+
+    // ------------ Sheet names ------------
+    protected array $SHEETS_WALLS     = ['Wall Systems', 'Walls', 'A1-A3 Walls'];
+    protected array $SHEETS_CLADDING  = ['Cladding Systems', 'Cladding', 'A1-A3 Cladding'];
+    protected array $SHEETS_SLABS     = ['Slab Systems', 'Slabs', 'A1-A3 Slabs'];
+    protected array $SHEET_A4_WALLS   = ['Wall Systems (A4)', 'Walls (A4)', 'A4 Walls', 'A4'];
+
+    // ------------ Column alias map (left = logical name we use in code) ------------
+    protected array $ALIASES = [
+        // System meta
+        'system_code'      => ['System Code','SystemCode','Code','MMC Code'],
+        'mmc_method'       => ['MMC Method','MMCMethod','Method','MMC Category'],
+        'assembly_id'      => ['Assembly ID','System ID','SystemID','ID'],
+        'system_name'      => ['System Name','SystemName','Name'],
+        'system_category'  => ['System Category','SystemCategory','System Type','SystemType'],
+
+        // Layer fields
+        'layer_no'         => ['Layer No.','LayerNo','Layer Number','Layer #'],
+        'functional_role'  => ['Functional Role','Role','Function'],
+        'generic_material' => ['Generic Material','Material','Generic Material Name'],
+
+        // Geometry / quantities
+        'length_m'         => ['Length (m)','Length_m','Length m'],
+        'height_m'         => ['Height (m)','Height_m','Height m'],
+        'thickness_m'      => ['Thickness (m)','Thickness_m','Thickness m','Thickness'],
+        'thickness_mm'     => ['Thickness (mm)','Thickness_mm','Thickness mm'],
+
+        'element_volume_m3'=> ['Element Volume (m3)','Element_Volume_m3','Elem Vol (m3)'],
+        'element_number'   => ['Element Number','Element_Number','Qty','Quantity'],
+        'total_volume_m3'  => ['Total Volume (m3)','Total_Volume_m3','Total Vol (m3)'],
+
+        // Physical props
+        'density_kg_m3'    => ['Density (kg/m3)','Density_kg_m3','Density kg/m3'],
+        'mass_kg_m2'       => ['Mass (kg/m²)','Mass kg/m2','Mass kg/m^2','Mass (kg/m2)'],
+
+        // Carbon
+        'carbon_factor'    => ['Carbon Factor (kgCO2e/kg)','Carbon Factor','Carbon factor (kgCO2e/kg)'],
+        'a1a3_per_m2'      => ['A1–A3 (kg CO2e / m²)','A1-A3 (kgCO2e/m2)','A1A3_kgCO2e_per_m2'],
+        'a1a3_per_5_76_m2' => ['A1–A3 (kg CO2e / 5.76 m²)','A1-A3 (kgCO2e / 5.76 m2)','A1A3_kgCO2e_per_5_76m2'],
+
+        // A4 (handled separately if you later map to environmental_factors)
+        'a4_per_m2'        => ['A4 (kgCO2e/m2)','A4 (kgCO₂e/m²)','A4_kgCO2e_per_m2'],
+    ];
 
     public function handle(): int
     {
-        $path  = $this->option('path') ?: base_path('ireland_generic_mmc_model.xlsx');
-        $sheet = $this->option('sheet') ?: 'Wall Systems';
-        $ver   = $this->option('dataset-version') ?: 'v2025.09';
-        $dumpN = (int) $this->option('dump');
-        $hdrAt = max(1, (int) $this->option('header-row'));
+        try {
+            // 1) Resolve import source and dataset_version_id
+            [$path, $datasetVersionId, $sourceFrom] = $this->resolveSourceAndDatasetVersion();
+            $this->line("Source: {$sourceFrom}");
+            $this->info("Using dataset_version_id = {$datasetVersionId}");
+            $this->line("Workbook: {$path}");
 
-        if (!is_file($path)) {
-            $this->error("File not found: $path");
-            return self::FAILURE;
-        }
+            // 2) Load workbook (read-only)
+            $reader = IOFactory::createReaderForFile($path);
+            $reader->setReadDataOnly(true);
+            $wb = $reader->load($path);
 
-        /** @var DatasetVersion $dataset */
-        $dataset = DatasetVersion::firstOrCreate(
-            ['module' => 'environmental', 'version_label' => $ver],
-            ['status' => 'draft', 'payload' => []]
-        );
-
-        // Load sheet by exact name via PhpSpreadsheet
-        $xlsx = IOFactory::load($path);
-        $ws   = $xlsx->getSheetByName($sheet);
-        if (!$ws) {
-            $this->error("Sheet not found: '{$sheet}'. Available: ".implode(', ', $xlsx->getSheetNames()));
-            return self::FAILURE;
-        }
-
-        // Normalize sheet -> default category (fallback if no column present)
-        $defaultCategory = $this->inferCategoryFromSheetName($sheet); // Wall | Cladding | Slab
-
-        // Pull rows as a 2D array preserving cell text
-        $rows = $ws->toArray(null, true, true, true); // [ [A=>..., B=>..., ...], ... ]
-
-        if (count($rows) < $hdrAt) {
-            $this->error("Sheet '{$sheet}' has fewer rows than the header row index ({$hdrAt}).");
-            return self::FAILURE;
-        }
-
-        // Build header map using the specified header row
-        $headerRow = $rows[$hdrAt] ?? [];
-        $map = $this->buildHeaderMap($headerRow);
-
-        // Quick visibility for you
-        $this->line("Mapped headers on '{$sheet}':");
-        foreach ($map as $k => $col) $this->line("  - {$k} ⇠ {$col}");
-
-        // Optionally reset (only for this category in this dataset)
-        if ($this->option('reset')) {
-            $deleted = EnvironmentalLayer::where('dataset_version_id', $dataset->id)
-                ->when($defaultCategory, fn($q)=>$q->where('system_category', $defaultCategory))
-                ->delete();
-            $this->warn("Reset: deleted {$deleted} existing rows for dataset {$ver} / {$defaultCategory}");
-        }
-
-        // Parse body (rows after header)
-        $parsed = [];
-        $startIx = $hdrAt + 1;
-        $totalRows = count($rows);
-
-        for ($r = $startIx; $r <= $totalRows; $r++) {
-            $cells = $rows[$r] ?? [];
-            // Get essentials
-            $assemblyId  = $this->cell($cells, Arr::get($map, 'assembly_id'));
-            $mmcMethod   = $this->cell($cells, Arr::get($map, 'mmc_method'));
-            $systemName  = $this->cell($cells, Arr::get($map, 'system_name'));
-            $srcHeader   = $this->cell($cells, Arr::get($map, 'source_header'));
-            $layerNo     = $this->toInt($this->cell($cells, Arr::get($map, 'layer_no')));
-
-            // Skip blank/summary rows (no assembly, no mmc, no name & no numbers)
-            if (!$assemblyId && !$mmcMethod && !$systemName) {
-                continue;
+            // 3) Reset (optional)
+            if ($this->option('reset')) {
+                DB::table('environmental_layers')->where('dataset_version_id', $datasetVersionId)->delete();
+                $this->warn("Reset: deleted existing environmental_layers for dataset_version_id={$datasetVersionId}");
             }
 
-            // Derive system_code from MMC Method; keep mmc_method verbatim too
-            $systemCode = $this->deriveSystemCode($mmcMethod, $systemName, $assemblyId);
-            if (!$systemCode) {
-                // If we can’t figure out a system code, we can’t key the record – skip
-                $this->line("• Skip row {$r}: cannot derive system_code (MMC Method='{$mmcMethod}')", 'vv');
-                continue;
+            // 4) Import main A1–A3 sheets (walls, cladding, slabs)
+            $total = 0;
+            $total += $this->importCategory($wb, $datasetVersionId, $this->SHEETS_WALLS,    'Wall',     'A1-A3 Walls');
+            $total += $this->importCategory($wb, $datasetVersionId, $this->SHEETS_CLADDING, 'Cladding', 'A1-A3 Cladding');
+            $total += $this->importCategory($wb, $datasetVersionId, $this->SHEETS_SLABS,    'Slab',     'A1-A3 Slabs');
+
+            $this->info("Imported {$total} layer rows.");
+
+            // (Optional) You can add A4 mapping into environmental_factors later if you want.
+            // For MVP we skip writing A4 rows here, since your results UI can read A4 elsewhere.
+
+            return self::SUCCESS;
+        } catch (\Throwable $e) {
+            $this->error("Import failed: {$e->getMessage()}");
+            if ($this->getOutput()->isVerbose()) {
+                $this->line($e->getTraceAsString());
+            }
+            return self::FAILURE;
+        }
+    }
+
+    // ---------------------------- Core import per category ----------------------------
+
+    protected function importCategory(\PhpOffice\PhpSpreadsheet\Spreadsheet $wb, int $datasetVersionId, array $sheetCandidates, string $systemCategory, string $sourceHeader): int
+    {
+        $sheetName = $this->pickSheet($wb, $sheetCandidates);
+        if (!$sheetName) {
+            $this->warn("No sheet found for {$systemCategory} (candidates: ".implode(', ', $sheetCandidates).')');
+            return 0;
+        }
+
+        $ws = $wb->getSheetByName($sheetName);
+        $rows = $ws->toArray(null, true, true, true);
+        if (!$rows) return 0;
+
+        // Find header row (first non-empty row)
+        $headerRow = null; $start = 0;
+        foreach ($rows as $i => $r) {
+            if (array_filter($r, fn($v) => $v !== null && $v !== '')) {
+                $headerRow = array_map(fn($x) => $x === null ? '' : trim((string)$x), array_values($r));
+                $start = $i + 1;
+                break;
+            }
+        }
+        if (!$headerRow) return 0;
+
+        // Build a map index => header name
+        $hdr = $headerRow;
+
+        // Helper to find source column by alias
+        $col = function(string $logical) use ($hdr) {
+            $targets = $this->ALIASES[$logical] ?? [$logical];
+            return $this->findHeader($hdr, $targets);
+        };
+
+        // Resolve columns once
+        $c_system_code      = $col('system_code');
+        $c_mmc_method       = $col('mmc_method');
+        $c_assembly_id      = $col('assembly_id');
+        $c_system_name      = $col('system_name');
+        $c_system_category  = $col('system_category');
+
+        $c_layer_no         = $col('layer_no');
+        $c_role             = $col('functional_role');
+        $c_mat              = $col('generic_material');
+
+        $c_len              = $col('length_m');
+        $c_hgt              = $col('height_m');
+        $c_thick_m          = $col('thickness_m');
+        $c_thick_mm         = $col('thickness_mm');
+        $c_elem_vol         = $col('element_volume_m3');
+        $c_elem_num         = $col('element_number');
+        $c_tot_vol          = $col('total_volume_m3');
+
+        $c_density          = $col('density_kg_m3');
+        $c_mass_m2          = $col('mass_kg_m2');
+
+        $c_cf               = $col('carbon_factor');
+        $c_a1a3_m2          = $col('a1a3_per_m2');
+        $c_a1a3_576         = $col('a1a3_per_5_76_m2');
+
+        $insert = [];
+        for ($i = $start; $i <= count($rows); $i++) {
+            $r = $rows[$i] ?? null; if (!$r) continue;
+            $vals = array_values($r);
+            if (!array_filter($vals, fn($v) => $v !== null && $v !== '')) continue;
+
+            $get = function($idx) use ($vals) {
+                return $idx === null ? null : ($vals[$idx] ?? null);
+            };
+
+            // Read raw values
+            $system_code  = $this->cleanStr($get($c_system_code));
+            $mmc_method   = $this->cleanStr($get($c_mmc_method));
+            $assembly_id  = $this->cleanStr($get($c_assembly_id)) ?: null;
+            $system_name  = $this->cleanStr($get($c_system_name)) ?: null;
+
+            // Prefer given sheet category label, fallback to column if present
+            $sys_cat      = $systemCategory ?: $this->cleanStr($get($c_system_category));
+            // Normalize common variants to your table values (Wall/Cladding/Slab)
+            $sys_cat      = $this->normalizeCategory($sys_cat);
+
+            // If system_code missing, try deriving from mmc_method
+            if (!$system_code) $system_code = $this->deriveSystemCode($mmc_method);
+
+            // Layer fields
+            $layer_no     = $this->toInt($get($c_layer_no));
+            $role         = $this->cleanStr($get($c_role));
+            $material     = $this->cleanStr($get($c_mat));
+
+            // Dimensions / quantities
+            $length_m     = $this->toFloat($get($c_len));
+            $height_m     = $this->toFloat($get($c_hgt));
+
+            $thickness_m  = $this->toFloat($get($c_thick_m));
+            if ($thickness_m === null && $c_thick_mm !== null) {
+                $mm = $this->toFloat($get($c_thick_mm));
+                if ($mm !== null) $thickness_m = $mm / 1000.0;
             }
 
-            $systemCategory = $this->cell($cells, Arr::get($map, 'system_category')) ?: $defaultCategory;
+            $elem_vol     = $this->toFloat($get($c_elem_vol));
+            $elem_num     = $this->toInt($get($c_elem_num));
+            $tot_vol      = $this->toFloat($get($c_tot_vol));
 
-            // Numerics (many may be blank on some sheets)
-            $lengthM   = $this->toNum($this->cell($cells, Arr::get($map, 'length_m')));
-            $heightM   = $this->toNum($this->cell($cells, Arr::get($map, 'height_m')));
-            $thickM    = $this->toNum($this->cell($cells, Arr::get($map, 'thickness_m')));
-            $elemVol   = $this->toNum($this->cell($cells, Arr::get($map, 'element_volume_m3')));
-            $elemNo    = $this->toInt($this->cell($cells, Arr::get($map, 'element_number')));
-            $totalVol  = $this->toNum($this->cell($cells, Arr::get($map, 'total_volume_m3')));
-            $density   = $this->toNum($this->cell($cells, Arr::get($map, 'density_kg_m3')));
-            $massKgM2  = $this->toNum($this->cell($cells, Arr::get($map, 'mass_kg_m2')));
-            $carbonFac = $this->toNum($this->cell($cells, Arr::get($map, 'carbon_factor')));
+            // Physical props
+            $density      = $this->toFloat($get($c_density));
+            $mass_m2      = $this->toFloat($get($c_mass_m2));
 
-            $a1a3_5p76 = $this->toNum($this->cell($cells, Arr::get($map, 'a1a3_per_5_76_m2')));
-            $a1a3_m2   = $this->toNum($this->cell($cells, Arr::get($map, 'a1a3_per_m2')));
+            // Carbon
+            $cf           = $this->toFloat($get($c_cf));
+            $a1a3_m2      = $this->toFloat($get($c_a1a3_m2));
+            $a1a3_576     = $this->toFloat($get($c_a1a3_576));
 
-            if ($a1a3_m2 === null && $a1a3_5p76 !== null) {
-                $a1a3_m2 = $a1a3_5p76 / 5.76;
+            // Sometimes A1-A3 is not given but can be computed from mass * carbon_factor
+            if ($a1a3_m2 === null && $mass_m2 !== null && $cf !== null) {
+                $a1a3_m2 = $mass_m2 * $cf;
             }
 
-            $parsed[] = [
-                'dataset_version_id' => $dataset->id,
-                'system_code'        => $systemCode,
-                'assembly_id'        => $assemblyId ?: null,
-                'mmc_method'         => $mmcMethod ?: null,
-                'system_name'        => $systemName ?: null,
-                'system_category'    => $systemCategory ?: null,
-                'source_header'      => $srcHeader ?: null,
-                'layer_no'           => $layerNo,
+            // Ignore header or empty garbage rows (require at least a material or role)
+            if ($role === null && $material === null) continue;
 
-                'functional_role'    => $this->cell($cells, Arr::get($map, 'functional_role')) ?: null,
-                'generic_material'   => $this->cell($cells, Arr::get($map, 'generic_material')) ?: null,
+            $insert[] = [
+                'dataset_version_id' => $datasetVersionId,
+                'system_code'        => $system_code ?: 'UNKNOWN',
+                'mmc_method'         => $mmc_method ?: null,
+                'assembly_id'        => $assembly_id,
+                'system_name'        => $system_name,
+                'system_category'    => $sys_cat,
+                'source_header'      => $sourceHeader,
 
-                'length_m'           => $lengthM,
-                'height_m'           => $heightM,
-                'thickness_m'        => $thickM,
-                'element_volume_m3'  => $elemVol,
-                'element_number'     => $elemNo,
-                'total_volume_m3'    => $totalVol,
+                'layer_no'           => $layer_no,
+                'functional_role'    => $role,
+                'generic_material'   => $material,
+
+                'length_m'           => $length_m,
+                'height_m'           => $height_m,
+                'thickness_m'        => $thickness_m,
+
+                'element_volume_m3'  => $elem_vol,
+                'element_number'     => $elem_num,
+                'total_volume_m3'    => $tot_vol,
+
                 'density_kg_m3'      => $density,
-                'mass_kg_m2'         => $massKgM2,
-                'carbon_factor'      => $carbonFac,
-                'a1a3_per_5_76_m2'   => $a1a3_5p76,
+                'mass_kg_m2'         => $mass_m2,
+
+                'carbon_factor'      => $cf,
+                'a1a3_per_5_76_m2'   => $a1a3_576,
                 'a1a3_per_m2'        => $a1a3_m2,
+
+                'created_at'         => now(),
+                'updated_at'         => now(),
             ];
         }
 
-        // Preview only?
-        if ($dumpN > 0) {
-            $this->info("Dumping first {$dumpN} parsed row(s) (no DB writes):");
-            collect($parsed)->take($dumpN)->each(function ($row, $i) {
-                $this->line(($i+1).') '.json_encode($row, JSON_UNESCAPED_UNICODE));
-            });
-            $this->line("Parsed total rows: ".count($parsed));
-            return self::SUCCESS;
-        }
-
-        // Upsert rows
-        $upserts = 0;
-        DB::transaction(function () use ($parsed, &$upserts) {
-            foreach ($parsed as $row) {
-                // Unique key per spec:
-                $match = Arr::only($row, ['dataset_version_id','system_code','assembly_id','layer_no']);
-                EnvironmentalLayer::updateOrCreate($match, Arr::except($row, array_keys($match)));
-                $upserts++;
+        // Bulk insert in chunks
+        $count = 0;
+        DB::transaction(function () use (&$count, $insert) {
+            foreach (array_chunk($insert, 1000) as $chunk) {
+                DB::table('environmental_layers')->insert($chunk);
+                $count += count($chunk);
             }
         });
 
-        $this->info("Upserted layers: +{$upserts} / ~ ".count($parsed)." for sheet [{$sheet}]");
-
-        // Aggregate A1–A3 per system_code (sum the layer a1a3_per_m2 if present)
-        $agg = EnvironmentalLayer::query()
-            ->selectRaw('system_code, SUM(COALESCE(a1a3_per_m2,0)) as s')
-            ->where('dataset_version_id', $dataset->id)
-            ->when($defaultCategory, fn($q)=>$q->where('system_category', $defaultCategory))
-            ->groupBy('system_code')
-            ->pluck('s', 'system_code')
-            ->toArray();
-
-        foreach ($agg as $code => $sum) {
-            EnvironmentalFactor::updateOrCreate(
-                ['dataset_version_id'=>$dataset->id, 'system_code'=>$code],
-                ['a1_a3_per_m2' => ($sum > 0 ? $sum : null)] // leave A4 untouched here
-            );
-        }
-
-        $codes = implode(', ', array_keys($agg));
-        $this->info("Aggregated A1–A3 factors per system_code: {$codes}");
-
-        return self::SUCCESS;
+        $this->info("  - {$systemCategory}: inserted {$count} rows from sheet '{$sheetName}'");
+        return $count;
     }
 
-    /* ---------- helpers ---------- */
+    // ---------------------------- Helpers ----------------------------
 
-    private function inferCategoryFromSheetName(string $sheet): ?string
+    protected function resolveSourceAndDatasetVersion(): array
     {
-        $s = Str::lower($sheet);
-        return match (true) {
-            Str::contains($s, 'wall')     => 'Wall',
-            Str::contains($s, 'cladding') => 'Cladding',
-            Str::contains($s, 'slab')     => 'Slab',
-            default => null,
-        };
-    }
+        // If an Admin Import queued this, prefer DataImport info
+        if ($id = $this->option('import-id')) {
+            /** @var DataImport $imp */
+            $imp = DataImport::query()->findOrFail($id);
 
-    private function buildHeaderMap(array $headerRow): array
-    {
-        // Normalize cell text -> canonical field name
-        $norm = [];
-        foreach ($headerRow as $col => $val) {
-            $key = $this->normHeader($val);
-            if ($key) $norm[$key] = $col; // e.g. 'system id' => 'B'
+            $disk = $imp->disk ?: 'public';
+            $path = \Storage::disk($disk)->path($imp->path);
+
+            // DatasetVersion: use the one already associated, else create one from label in meta if present
+            $datasetVersionId = $imp->dataset_version_id
+                ?: $this->findOrCreateDatasetVersionId(
+                    module: 'environmental',
+                    label: data_get($imp->meta, 'dataset_label') ?: (string)$imp->id
+                );
+
+            // Backfill onto the DataImport row for consistency
+            if (!$imp->dataset_version_id) {
+                $imp->dataset_version_id = $datasetVersionId;
+                $imp->save();
+            }
+
+            return [$path, $datasetVersionId, "DataImport#{$imp->id} ({$imp->original_name})"];
         }
 
-        // Known mappings (synonyms tolerated)
-        $want = [
-            'system_category'      => ['system category'],
-            'assembly_id'          => ['system id', 'assembly id'],
-            'mmc_method'           => ['mmc method', 'mmc'],
-            'system_name'          => ['system name'],
-            'source_header'        => ['source header'],
-            'layer_no'             => ['layer no', 'layer no.'],
-            'functional_role'      => ['functional role'],
-            'generic_material'     => ['generic material'],
+        // Manual path
+        $path = (string) $this->option('path');
+        if (!$path || !is_file($path)) {
+            throw new \RuntimeException('--path is required (absolute path to workbook) or use --import-id=');
+        }
 
-            'length_m'             => ['length m'],
-            'height_m'             => ['height m'],
-            'thickness_m'          => ['thickness m'],
+        // DatasetVersion selection
+        if ($this->option('dataset-version-id')) {
+            $id = (int) $this->option('dataset-version-id');
+            $exists = DatasetVersion::query()->whereKey($id)->exists();
+            if (!$exists) throw new \RuntimeException("dataset_version_id={$id} not found.");
+            return [$path, $id, 'manual path'];
+        }
 
-            'element_volume_m3'    => ['element volume m3', 'element vol m3'],
-            'element_number'       => ['element number', 'elem number', 'element no'],
-            'total_volume_m3'      => ['total volume m3', 'total vol m3'],
+        $labelOrId = (string) $this->option('dataset-version');
+        if (!$labelOrId) {
+            // Sensible default label: timestamp
+            $labelOrId = now()->format('Ymd_His');
+        }
 
-            'density_kg_m3'        => ['density kg m3', 'density kg.m3'],
-            'mass_kg_m2'           => ['mass kg m2', 'mass kg m²', 'mass kg per m2'],
-            'carbon_factor'        => ['carbon factor'],
+        // If numeric and exists as ID, use it; else find/create by label under module='environmental'
+        $datasetVersionId = $this->resolveDatasetVersionId('environmental', $labelOrId);
 
-            'a1a3_per_5_76_m2'     => [
-                'a1 a3 kgco2e 5 76 m2',
-                'a1 a3 kgco2e per 5 76 m2',
-                'a1–a3 kgco2e 5 76 m2',
-                'a1-a3 kgco2e 5 76 m2',
-            ],
-            'a1a3_per_m2'          => [
-                'a1 a3 kgco2e m2',
-                'a1–a3 kgco2e m2',
-                'a1-a3 kgco2e m2',
-            ],
-        ];
+        return [$path, $datasetVersionId, 'manual path'];
+    }
 
-        $map = [];
-        foreach ($want as $field => $candidates) {
-            foreach ($candidates as $cand) {
-                if (isset($norm[$cand])) {
-                    $map[$field] = $norm[$cand];
-                    break;
+    protected function resolveDatasetVersionId(string $module, string $labelOrId): int
+    {
+        if (ctype_digit($labelOrId)) {
+            $id = (int) $labelOrId;
+            $exists = DatasetVersion::query()->whereKey($id)->exists();
+            if ($exists) return $id;
+        }
+
+        return $this->findOrCreateDatasetVersionId($module, $labelOrId);
+    }
+
+    protected function findOrCreateDatasetVersionId(string $module, string $label): int
+    {
+        $dv = DatasetVersion::query()
+            ->where('module', $module)
+            ->where('version_label', $label)
+            ->first();
+
+        if ($dv) return (int) $dv->id;
+
+        $dv = DatasetVersion::create([
+            'module'        => $module,
+            'version_label' => $label,
+            'status'        => 'draft',   // do not auto-publish
+            'is_current'    => false,
+        ]);
+
+        return (int) $dv->id;
+    }
+
+    protected function pickSheet(\PhpOffice\PhpSpreadsheet\Spreadsheet $wb, array $candidates): ?string
+    {
+        $names = $wb->getSheetNames();
+        // Search by case-insensitive contains
+        foreach ($candidates as $cand) {
+            foreach ($names as $n) {
+                if (Str::of($n)->lower()->contains(Str::of($cand)->lower())) {
+                    return $n;
                 }
             }
         }
-
-        return $map;
+        // Exact match fallback
+        foreach ($candidates as $cand) {
+            if (in_array($cand, $names, true)) return $cand;
+        }
+        return null;
     }
 
-    private function normHeader($v): ?string
+    protected function findHeader(array $headerRow, array $aliases): ?int
     {
-        $s = trim((string)$v);
-        if ($s === '') return null;
+        // return index in $headerRow for the first alias that appears (fuzzy contains)
+        $norm = fn($s) => strtolower(preg_replace('/\s+/', '', (string)$s));
+        $targets = array_map($norm, $aliases);
 
-        // Replace unicode dashes and CO₂ with ascii
-        $s = str_replace(['–','—','−'], '-', $s);
-        $s = str_replace(['²','/m²','m²'], ['2','/m2','m2'], $s);
-        $s = str_replace(['CO₂','co₂','Co₂'], 'CO2', $s);
-
-        // strip everything that’s not a-z0-9 or space
-        $s = Str::lower($s);
-        $s = preg_replace('/[^a-z0-9]+/',' ', $s);
-        $s = trim(preg_replace('/\s+/',' ', $s));
-        return $s;
+        foreach ($headerRow as $idx => $label) {
+            $h = $norm($label);
+            foreach ($targets as $t) {
+                if ($t !== '' && Str::contains($h, $t)) return $idx;
+            }
+        }
+        return null;
     }
 
-    private function cell(array $row, ?string $col)
+    protected function normalizeCategory(?string $v): ?string
     {
-        return $col ? (isset($row[$col]) ? trim((string)$row[$col]) : null) : null;
+        if ($v === null) return null;
+        $s = strtolower(trim($v));
+        if (str_contains($s, 'wall')) return 'Wall';
+        if (str_contains($s, 'clad')) return 'Cladding';
+        if (str_contains($s, 'slab')) return 'Slab';
+        return ucfirst($s);
     }
 
-    private function toNum($v): ?float
+    protected function deriveSystemCode(?string $mmcMethod): ?string
+    {
+        if (!$mmcMethod) return null;
+        $s = strtolower($mmcMethod);
+        return match (true) {
+            str_contains($s, 'block')                => 'BLOCK',
+            str_contains($s, 'lgs') || str_contains($s, 'light gauge') => 'LGS',
+            str_contains($s, 'timber')               => 'TIMBER',
+            str_contains($s, 'icf')                  => 'ICF',
+            default                                  => strtoupper(Str::slug($mmcMethod, '_')),
+        };
+    }
+
+    protected function cleanStr($v): ?string
     {
         if ($v === null) return null;
         $s = trim((string)$v);
+        return $s === '' ? null : $s;
+    }
+
+    protected function toFloat($v): ?float
+    {
+        if ($v === null) return null;
+        if (is_numeric($v)) return (float)$v;
+        $s = trim((string)$v);
         if ($s === '') return null;
-        // tolerate commas, newlines, etc.
-        $s = str_replace([",","\n","\r"], ['.','',''], $s);
-        return is_numeric($s) ? (float)$s : null;
+
+        // 1.000,25 -> 1000.25
+        if (preg_match('/^\d{1,3}(\.\d{3})+,\d+$/', $s)) {
+            return (float) str_replace([ '.', ',' ], [ '', '.' ], $s);
+        }
+        // 1,000.25 or 1,000
+        if (preg_match('/^\d{1,3}(,\d{3})+(\.\d+)?$/', $s)) {
+            return (float) str_replace(',', '', $s);
+        }
+        // 1000,25 -> 1000.25
+        if (preg_match('/^\d+,\d+$/', $s)) {
+            return (float) str_replace(',', '.', $s);
+        }
+        $s2 = preg_replace('/[^0-9eE\.\-\+]/', '', $s);
+        return is_numeric($s2) ? (float)$s2 : null;
     }
 
-    private function toInt($v): ?int
+    protected function toInt($v): ?int
     {
-        $f = $this->toNum($v);
+        $f = $this->toFloat($v);
         return $f === null ? null : (int) round($f);
-    }
-
-    private function deriveSystemCode(?string $mmcMethod, ?string $systemName, ?string $assemblyId): ?string
-    {
-        $cand = strtoupper(trim((string)$mmcMethod));
-
-        // Common cases
-        foreach (['LGS','TF','ICF','SIP','CLT'] as $code) {
-            if (Str::startsWith($cand, $code)) return $code;
-        }
-        if (Str::contains($cand, ['MASONRY','BLOCK'])) return 'BLOCK';
-
-        // Try the first token (if it looks like an all-caps abbreviation)
-        if (preg_match('/^([A-Z]{2,6})\b/', $cand, $m)) {
-            return $m[1];
-        }
-
-        // Fallbacks
-        if ($assemblyId && Str::startsWith($assemblyId, 'WALL_')) return 'BLOCK'; // sensible default for masonry sheets
-        return null;
     }
 }

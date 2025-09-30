@@ -4,160 +4,188 @@ namespace App\Livewire\Assessments;
 
 use App\Models\Assessment;
 use App\Models\DatasetVersion;
-use App\Models\Project;
-use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use App\Services\EnvironmentalCalculator;
+use Illuminate\Support\Facades\DB;
 use Livewire\Attributes\Layout;
 use Livewire\Component;
 
 #[Layout('layouts.app')]
 class EnvironmentalForm extends Component
 {
-    use AuthorizesRequests;
+    /** Route param support (e.g. /projects/{project}/environmental) */
+    public ?int $projectId = null;
 
-    public Project $project;
+    // Inputs
+    public ?float $a1_a3 = null;
+    public ?float $a4_a5 = null;
+    public ?float $c1_c4 = null;
 
-    // Carbon footprint (kgCO₂e)
-    public ?float $a1_a3 = null; // Product Stage
-    public ?float $a4_a5 = null; // Construction Stage
-    public ?float $c1_c4 = null; // End-of-life Stage
+    public ?float $u_value = null;
+    public ?string $ber_rating = null;
 
-    // Energy efficiency
-    public ?float $u_value = null;       // W/m²K
-    public ?string $ber_rating = null;   // A1..G
+    public ?int $reuse_potential = null;        // %
+    public ?int $material_recyclability = null; // %
 
-    // End-of-life recyclability (%)
-    public ?float $reuse_potential = null;
-    public ?float $material_recyclability = null;
+    // Optional snapshot method
+    public ?string $selected_system_code = null; // e.g. BLOCK|ICF|LGS|TIMBER
 
-    public string $saved_at = '';
+    // Helpful UI notice (not a session flash—Livewire re-render)
+    public ?string $notice = null;
 
-    protected function rules(): array
+    // Cache the DV id we’re working with
+    public ?int $datasetVersionId = null;
+
+    /** Accepts either a Project model (route-model bound) or id */
+    public function mount($project = null): void
     {
-        return [
-            'a1_a3'                  => ['nullable','numeric','min:0'],
-            'a4_a5'                  => ['nullable','numeric','min:0'],
-            'c1_c4'                  => ['nullable','numeric','min:0'],
-            'u_value'                => ['nullable','numeric','min:0'],
-            'ber_rating'             => ['nullable','in:A1,A2,A3,B1,B2,B3,C1,C2,C3,D1,D2,E1,E2,F,G'],
-            'reuse_potential'        => ['nullable','numeric','min:0','max:100'],
-            'material_recyclability' => ['nullable','numeric','min:0','max:100'],
-        ];
-    }
-
-    public function mount(Project $project): void
-    {
-        $this->authorize('view', $project);
-        $this->project = $project;
-
-        // Prefill from most recent environmental assessment, if any
-        $latest = Assessment::query()
-            ->where('project_id', $project->id)
-            ->where('type', 'environmental')
-            ->latest('id')
-            ->first();
-
-        if ($latest) {
-            $in = (array) $latest->inputs;
-            $this->a1_a3                  = data_get($in, 'a1_a3');
-            $this->a4_a5                  = data_get($in, 'a4_a5');
-            $this->c1_c4                  = data_get($in, 'c1_c4');
-            $this->u_value                = data_get($in, 'u_value');
-            $this->ber_rating             = data_get($in, 'ber_rating');
-            $this->reuse_potential        = data_get($in, 'reuse_potential');
-            $this->material_recyclability = data_get($in, 'material_recyclability');
+        if (is_object($project) && property_exists($project, 'id')) {
+            $this->projectId = (int) $project->id;
+        } elseif (is_numeric($project)) {
+            $this->projectId = (int) $project;
         }
-    }
 
-    public function save(): void
-    {
-        $this->validate();
-
-        // Ensure we have a published dataset for 'environmental'.
-        $dv = $this->ensureEnvDataset();
-
-        $inputs = [
-            'a1_a3'                  => $this->a1_a3,
-            'a4_a5'                  => $this->a4_a5,
-            'c1_c4'                  => $this->c1_c4,
-            'u_value'                => $this->u_value,
-            'ber_rating'             => $this->ber_rating,
-            'reuse_potential'        => $this->reuse_potential,
-            'material_recyclability' => $this->material_recyclability,
-        ];
-
-        $total_co2 = (float) ($this->a1_a3 ?? 0)
-                   + (float) ($this->a4_a5 ?? 0)
-                   + (float) ($this->c1_c4 ?? 0);
-
-        $outputs = [
-            'total_co2' => round($total_co2, 3), // kgCO2e
-        ];
-
-        Assessment::create([
-            'project_id'         => $this->project->id,
-            'type'               => 'environmental',
-            'dataset_version_id' => $dv->id,          // guaranteed here
-            'inputs'             => $inputs,
-            'outputs'            => $outputs,
-            'status'             => 'completed',
-        ]);
-
-        $this->saved_at = now()->toDateTimeString();
-        $this->dispatch('env-saved');
-    }
-
-    private function ensureEnvDataset(): DatasetVersion
-    {
-        // 1) Prefer a published one
         $dv = DatasetVersion::query()
             ->where('module', 'environmental')
             ->where('status', 'published')
             ->latest('id')
             ->first();
 
-        // 2) Otherwise use any latest one
-        if (!$dv) {
-            $dv = DatasetVersion::query()
-                ->where('module', 'environmental')
-                ->latest('id')
-                ->first();
-        }
-
-        // 3) If none exist, create a published placeholder for demo use
-        if (!$dv) {
-            $dv = DatasetVersion::create([
-                'module'        => 'environmental',
-                'version_label' => 'env-' . now()->format('Y.m.d-His'),
-                'status'        => 'published',
-                'notes'         => 'Auto-created by EnvironmentalForm (placeholder for demo).',
-            ]);
-        }
-
-        // If we found a non-published one, promote it so results link to a published dataset
-        if ($dv->status !== 'published') {
-            $dv->update(['status' => 'published']);
-        }
-
-        return $dv->fresh();
+        $this->datasetVersionId = $dv?->id;
     }
 
-    public function getBerOptions(): array
+    public function rules(): array
     {
         return [
-            'A1','A2','A3',
-            'B1','B2','B3',
-            'C1','C2','C3',
-            'D1','D2',
-            'E1','E2',
-            'F','G',
+            'a1_a3' => ['nullable','numeric','min:0'],
+            'a4_a5' => ['nullable','numeric','min:0'],
+            'c1_c4' => ['nullable','numeric','min:0'],
+            'u_value' => ['nullable','numeric','min:0'],
+            'ber_rating' => ['nullable','in:A1,A2,A3,B1,B2,B3,C1,C2,C3,D1,D2,E1,E2,F,G'],
+            'reuse_potential' => ['nullable','integer','between:0,100'],
+            'material_recyclability' => ['nullable','integer','between:0,100'],
+            'selected_system_code' => ['nullable','string','max:32'],
         ];
+    }
+
+    /**
+     * TEMP: Populate fields with mid-range values based on the selected method.
+     * Defaults to TIMBER when none selected.
+     */
+    public function populateSample(): void
+    {
+        $code = strtoupper((string)($this->selected_system_code ?: 'TIMBER'));
+
+        $samples = [
+            'BLOCK' => [
+                'a1_a3' => 220.0, 'a4_a5' => 20.0, 'c1_c4' => 70.0,
+                'u_value' => 0.18, 'ber' => 'A3', 'reuse' => 5, 'recycle' => 40,
+            ],
+            'ICF' => [
+                'a1_a3' => 160.0, 'a4_a5' => 15.0, 'c1_c4' => 30.0,
+                'u_value' => 0.15, 'ber' => 'A2', 'reuse' => 10, 'recycle' => 50,
+            ],
+            'LGS' => [
+                'a1_a3' => 170.0, 'a4_a5' => 18.0, 'c1_c4' => 35.0,
+                'u_value' => 0.18, 'ber' => 'A2', 'reuse' => 15, 'recycle' => 90,
+            ],
+            'TIMBER' => [
+                'a1_a3' => 90.0, 'a4_a5' => 12.0, 'c1_c4' => 20.0,
+                'u_value' => 0.15, 'ber' => 'A2', 'reuse' => 30, 'recycle' => 60,
+            ],
+        ];
+
+        $s = $samples[$code] ?? $samples['TIMBER'];
+
+        $this->a1_a3 = $s['a1_a3'];
+        $this->a4_a5 = $s['a4_a5'];
+        $this->c1_c4 = $s['c1_c4'];
+
+        $this->u_value = $s['u_value'];
+        $this->ber_rating = $s['ber'];
+
+        $this->reuse_potential = $s['reuse'];
+        $this->material_recyclability = $s['recycle'];
+
+        // Ensure dropdown reflects the method we’re sampling
+        $this->selected_system_code = $code;
+
+        $this->notice = "Sample values populated for {$code}.";
+    }
+
+    public function save()
+    {
+        $this->validate();
+
+        $dv = $this->datasetVersionId
+            ? DatasetVersion::find($this->datasetVersionId)
+            : DatasetVersion::where('module','environmental')->where('status','published')->latest('id')->first();
+
+        if (!$dv) {
+            $this->notice = 'No published Environmental dataset found. Please import & publish one.';
+            return;
+        }
+
+        $inputs = [
+            'a1_a3' => $this->a1_a3 ?? 0.0,
+            'a4_a5' => $this->a4_a5 ?? 0.0,
+            'c1_c4' => $this->c1_c4 ?? 0.0,
+            'u_value' => $this->u_value,
+            'ber_rating' => $this->ber_rating,
+            'reuse_potential' => $this->reuse_potential,
+            'material_recyclability' => $this->material_recyclability,
+            'selected_system_code' => $this->selected_system_code,
+            'project_id' => $this->projectId,
+        ];
+
+        $total = (float) ($inputs['a1_a3'] + $inputs['a4_a5'] + $inputs['c1_c4']);
+
+        $outputs = [
+            'total_co2' => $total,
+            'breakdown' => [
+                'a1_a3' => $inputs['a1_a3'],
+                'a4_a5' => $inputs['a4_a5'],
+                'c1_c4' => $inputs['c1_c4'],
+            ],
+            'envelope' => [
+                'u_value' => $inputs['u_value'],
+                'ber_rating' => $inputs['ber_rating'],
+            ],
+            'eol' => [
+                'reuse_potential' => $inputs['reuse_potential'],
+                'material_recyclability' => $inputs['material_recyclability'],
+            ],
+        ];
+
+        // Optional layer snapshot from published dataset
+        if ($this->selected_system_code) {
+            /** @var EnvironmentalCalculator $calc */
+            $calc = app(EnvironmentalCalculator::class);
+            $snapshot = $calc->snapshotForSystem($dv, $this->selected_system_code);
+            $outputs['layer_snapshot'] = $snapshot;
+        }
+
+        $assessment = Assessment::create([
+            'type' => 'environmental',
+            'dataset_version_id' => $dv->id,
+            'project_id' => $this->projectId,
+            'inputs' => $inputs,
+            'outputs' => $outputs,
+        ]);
+
+        return redirect()->route('assessments.results', $assessment);
     }
 
     public function render()
     {
+        // restrict to current DV if set
+        $query = DB::table('environmental_layers')->distinct()->select('system_code');
+        if ($this->datasetVersionId) {
+            $query->where('dataset_version_id', $this->datasetVersionId);
+        }
+        $systemCodes = $query->orderBy('system_code')->pluck('system_code')->values()->all();
+
         return view('livewire.assessments.environmental-form', [
-            'project'    => $this->project,
-            'berOptions' => $this->getBerOptions(),
+            'systemCodes' => $systemCodes,
         ]);
     }
 }

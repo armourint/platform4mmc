@@ -21,7 +21,7 @@ return [
 
     'environmental' => [
         'label'           => 'Environmental Layers',
-        'command'         => 'mmc:import-env-layers',
+        'command'         => 'mmc:import-environmental-layers',
         'path_option'     => '--path',
         'dataset_option'  => '--dataset-version',
         'supports_reset'  => true,

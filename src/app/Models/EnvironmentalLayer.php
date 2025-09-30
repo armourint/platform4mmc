@@ -9,44 +9,29 @@ class EnvironmentalLayer extends Model
     protected $fillable = [
         'dataset_version_id',
         'system_code',
-        'mmc_method',
-        'assembly_id',
-        'system_name',
-        'system_category',
-        'source_header',
-        'layer_no',
-        'functional_role',
-        'generic_material',
-        'length_m',
-        'height_m',
-        'thickness_m',
-        'element_volume_m3',
-        'element_number',
-        'total_volume_m3',
+        'layer_code',
+        'layer_name',
+        'thickness_mm',
         'density_kg_m3',
-        'mass_kg_m2',
-        'carbon_factor',
-        'a1a3_per_5_76_m2',
+        'a1a3_per_kg',
         'a1a3_per_m2',
+        'a4_per_m2',
+        'source_epd',
+        'notes',
+        // Optional mapping helpers from your workbook:
+        'system_id_ref',
+        'system_name_ref',
+        'mass_per_m2_kg',
+        'carbon_factor_kgco2e_per_kg',
     ];
 
     protected $casts = [
-        'length_m'            => 'float',
-        'height_m'            => 'float',
-        'thickness_m'         => 'float',
-        'element_volume_m3'   => 'float',
-        'element_number'      => 'int',
-        'total_volume_m3'     => 'float',
-        'density_kg_m3'       => 'float',
-        'mass_kg_m2'          => 'float',
-        'carbon_factor'       => 'float',
-        'a1a3_per_5_76_m2'    => 'float',
-        'a1a3_per_m2'         => 'float',
-        'layer_no'            => 'int',
+        'thickness_mm' => 'float',
+        'density_kg_m3' => 'float',
+        'a1a3_per_kg' => 'float',
+        'a1a3_per_m2' => 'float',
+        'a4_per_m2' => 'float',
+        'mass_per_m2_kg' => 'float',
+        'carbon_factor_kgco2e_per_kg' => 'float',
     ];
-
-    public function datasetVersion()
-    {
-        return $this->belongsTo(DatasetVersion::class);
-    }
 }
