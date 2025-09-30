@@ -3,360 +3,365 @@
 namespace App\Console\Commands;
 
 use App\Models\DatasetVersion;
+use App\Models\DataImport;
 use App\Models\Rule;
-use App\Models\System;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
-use Maatwebsite\Excel\Facades\Excel;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use PhpOffice\PhpSpreadsheet\IOFactory;
 
 class ImportViabilityRulesFromExcel extends Command
 {
     protected $signature = 'mmc:import-viability-rules
-        {--path= : Path to mmc_viability_data.xlsx}
-        {--sheet= : Sheet name (optional; defaults to first sheet)}
-        {--dataset-version= : Dataset version label (e.g. v2025.09)}
-        {--module=viability : Module name to attach rules to (default: viability)}
-        {--priority=10 : Priority to assign to created rules}
-        {--reason-prefix= : Optional text prefixed to auto-generated “excluded for …” reason}
-        {--reset : Delete existing rules for this dataset/module before importing}
-        {--dry-run : Parse and report, but don’t write to DB}
-    ';
+        {--path= : Path to Excel (absolute or storage/app/public relative)}
+        {--import-id= : data_imports.id to resolve file + dataset_version_id}
+        {--dataset-version= : Version label (only used if a new draft must be created)}
+        {--dataset-version-id= : Reuse this dataset_versions.id (never create another)}
+        {--reset : Delete existing rules for this dataset version first}
+        {--sheet=viability_rules : Sheet name (default: viability_rules)}';
 
-    protected $description = 'Import system viability rules from mmc_viability_data.xlsx (creates EXCLUDE rules for FALSE flags).';
+    protected $description = 'Import simplified viability rules from mmc_viability_data.xlsx into rules for a draft dataset version.';
+
+    /** Human → system_code mapping (adjust to your canonical codes) */
+    private array $methodToSystem = [
+        'Concrete Block' => 'BLOCK',
+        'ICF'            => 'ICF',
+        'LGS'            => 'LGS',
+        'Timber'         => 'TIMBER',
+    ];
 
     public function handle(): int
     {
-        $path      = $this->option('path') ?: base_path('mmc_viability_data.xlsx');
-        $sheetName = $this->option('sheet');
-        $version   = $this->option('dataset-version');
-        $module    = (string)($this->option('module') ?: 'viability');
-        $priority  = (int) $this->option('priority');
-        $prefix    = (string)($this->option('reason-prefix') ?: '');
-        $dryRun    = (bool) $this->option('dry-run');
+        $sheetName = (string) ($this->option('sheet') ?: 'viability_rules');
 
-        if (!is_file($path)) {
-            $this->error("File not found: {$path}");
-            return self::FAILURE;
+        /** -------------------------------------------------------------
+         * 1) Decide which dataset_version to use (REUSE if provided)
+         * ------------------------------------------------------------ */
+        $dv = null;
+
+        // Highest precedence: explicit dataset version id
+        if ($id = $this->option('dataset-version-id')) {
+            $dv = DatasetVersion::find($id);
+            if (!$dv) {
+                $this->error("DatasetVersion #{$id} not found.");
+                return self::FAILURE;
+            }
+            $this->info("Using existing DatasetVersion #{$dv->id} ({$dv->module}/{$dv->status}/{$dv->version_label}).");
         }
-        if (!$version) {
-            $this->error('Missing required option: --dataset-version');
-            return self::FAILURE;
-        }
 
-        $dataset = DatasetVersion::firstOrCreate(
-            ['module' => 'viability', 'version_label' => $version],
-            ['status' => 'draft', 'payload' => []]
-        );
-
-        if ($this->option('reset')) {
-            if ($dryRun) {
-                $count = Rule::where('dataset_version_id', $dataset->id)
-                    ->where('module', $module)->count();
-                $this->warn("DRY-RUN Reset: would delete {$count} rule(s) for dataset {$version} / module {$module}.");
-            } else {
-                $deleted = Rule::where('dataset_version_id', $dataset->id)
-                    ->where('module', $module)->delete();
-                $this->info("Reset: deleted {$deleted} rule(s) for dataset {$version} / module {$module}.");
+        // Next: via import-id
+        $import = null;
+        if ($importId = $this->option('import-id')) {
+            $import = DataImport::find($importId);
+            if (!$import) {
+                $this->error("DataImport #{$importId} not found.");
+                return self::FAILURE;
+            }
+            if (!$dv && $import->dataset_version_id) {
+                $dv = DatasetVersion::find($import->dataset_version_id);
+                if ($dv) {
+                    $this->info("Reusing DatasetVersion from DataImport: #{$dv->id} ({$dv->module}/{$dv->status}/{$dv->version_label}).");
+                }
             }
         }
 
-        // Load excel
-        $sheets = Excel::toArray(null, $path);
-        if (empty($sheets)) {
-            $this->error('No sheets found.');
+        // Finally: create/reuse a draft by label only if we still don't have one
+        if (!$dv) {
+            $label = (string) ($this->option('dataset-version') ?: 'viability-'.date('Ymd-His'));
+            $dv = DatasetVersion::firstOrCreate(
+                ['module' => 'viability', 'status' => 'draft', 'version_label' => $label],
+                []
+            );
+            $this->info("Created/reused draft DatasetVersion #{$dv->id} (label={$label}).");
+
+            // Backfill link on DataImport if present
+            if ($import && !$import->dataset_version_id) {
+                $import->dataset_version_id = $dv->id;
+                $import->save();
+            }
+        }
+
+        $labelForLog = $dv->version_label ?? '(no-label)';
+
+        /** -------------------------------------------------------------
+         * 2) Resolve the Excel file path
+         * ------------------------------------------------------------ */
+        $pathOpt = (string) ($this->option('path') ?? '');
+        if ($import && !$pathOpt) {
+            $disk = $import->disk ?: 'public';
+            $path = Storage::disk($disk)->path($import->path);
+            $this->info("Resolved file from DataImport disk/path: {$path}");
+        } else {
+            $path = $this->resolvePath($pathOpt);
+            $this->info("Resolved file from --path: {$path}");
+        }
+
+        if (!is_readable($path)) {
+            $this->error("Excel file not readable at: {$path}");
             return self::FAILURE;
         }
-        $active = null;
-        if ($sheetName) {
-            // Try to find by name — Excel::toArray doesn’t return names,
-            // so we just pick the first sheet (caller should ensure the
-            // requested sheet is first if needed).
-            $this->warn('Note: Maatwebsite Excel::toArray() does not preserve sheet names; using first sheet.');
-        }
-        $active = $sheets[0];
 
-        if (empty($active) || !is_array($active) || count($active) < 2) {
-            $this->error('Active sheet appears empty (need at least header + 1 row).');
+        /** -------------------------------------------------------------
+         * 3) Optional reset of rules for this dataset version
+         * ------------------------------------------------------------ */
+        if ($this->option('reset')) {
+            Rule::where('dataset_version_id', $dv->id)->delete();
+            $this->info("Cleared existing rules for dataset_version #{$dv->id} ({$labelForLog}).");
+        }
+
+        /** -------------------------------------------------------------
+         * 4) Load workbook & sheet
+         * ------------------------------------------------------------ */
+        $spreadsheet = IOFactory::load($path);
+        $sheet = $spreadsheet->getSheetByName($sheetName);
+        if (!$sheet) {
+            $this->error("Sheet '{$sheetName}' not found.");
             return self::FAILURE;
         }
 
-        // Normalize headers
-        $headerRow = array_shift($active);
-        $norm      = fn (?string $v) => $this->normalizeHeader($v);
-        $headers   = array_map($norm, $headerRow);
+        $rows = $sheet->toArray(null, true, true, true);
+        if (count($rows) < 2) {
+            $this->warn('No data rows found (need header + at least one data row).');
+            return self::SUCCESS;
+        }
 
-        // Build column index map using flexible header detection
-        $idx = [
-            'mmc_method' => $this->findHeaderIndex($headers, [
-                'mmc_method', 'mmc', 'method', 'system', 'mmc_method---'
-            ]),
+        /** -------------------------------------------------------------
+         * 5) Normalize headers & map required columns
+         * ------------------------------------------------------------ */
+        $rawHeaders  = array_values($rows[1] ?? []);
+        $normHeaders = array_map([$this, 'norm'], $rawHeaders);
+        $colIndex    = fn(string $want) => array_search($want, $normHeaders, true);
 
-            // Boolean viability flags (treated as tri-state)
-            'low_rise'            => $this->findHeaderIndexLike($headers, '/\blow\b.*\brise\b/i'),
-            'medium_rise'         => $this->findHeaderIndexLike($headers, '/\bmedium\b.*\brise\b/i'),
-            'high_rise'           => $this->findHeaderIndexLike($headers, '/\bhigh\b.*\brise\b/i'),
-            'on_site_storage'     => $this->findHeaderIndexLike($headers, '/on.*site.*storage/i'),
-            'off_site_storage'    => $this->findHeaderIndexLike($headers, '/off.*site.*storage/i'),
-            'tower_crane'         => $this->findHeaderIndexLike($headers, '/tower.*crane/i'),
-            'telescopic_crane'    => $this->findHeaderIndexLike($headers, '/telescopic.*crane/i'),
-            'telehandler_crane'   => $this->findHeaderIndexLike($headers, '/telehandler.*crane/i'),
-            'flatbed_truck'       => $this->findHeaderIndexLike($headers, '/flatbed.*truck/i'),
-            'flatbed_a_frame'     => $this->findHeaderIndexLike($headers, '/flatbed.*a.*frame/i'),
-
-            // Numeric constraints (optional)
-            'max_panel_height_m'        => $this->findHeaderIndexLike($headers, '/max.*panel.*height/i'),
-            'max_frame_length_m'        => $this->findHeaderIndexLike($headers, '/max.*frame.*length/i'),
-            'max_frame_width_lt_3_2_m'  => $this->findHeaderIndexLike($headers, '/max.*width.*(lt|<).*(3[.,]2|3\.2)/i'),
-            'max_frame_width_gt_3_2_m'  => $this->findHeaderIndexLike($headers, '/max.*width.*(gt|>).*(3[.,]2|3\.2)/i'),
+        // Expected logical columns → normalized header keys we search for
+        $need = [
+            'mmc_method'                => 'mmc_method',
+            'low_rise'                  => 'low_rise',
+            'medium_rise'               => 'medium_rise',
+            'high_rise'                 => 'high_rise',
+            'on_site_storage'           => 'on_site_storage',
+            'off_site_storage'          => 'off_site_storage',
+            'tower_crane'               => 'tower_crane',
+            'telescopic_crane'          => 'telescopic_crane',
+            'telehandler_crane'         => 'telehandler_crane',
+            'flatbed_truck'             => 'flatbed_truck',
+            'flatbed_a_frame'           => 'flatbed_a_frame',
+            'max_panel_height_m'        => 'max_panel_height_m',
+            'max_frame_length_m'        => 'max_frame_length_m',
+            'max_frame_width_le_3_2_m'  => 'max_frame_width_less_than_3_2_m',
+            'max_frame_width_gt_3_2_m'  => 'max_frame_width_more_than_3_2_m',
         ];
 
+        $idx = [];
+        foreach ($need as $logical => $key) {
+            $i = $colIndex($key);
+            $idx[$logical] = $i !== false ? $i : null;
+        }
+
         if ($idx['mmc_method'] === null) {
-            $this->error('Missing required column: MMC Method (cannot resolve system).');
+            $this->error("Required column 'MMC Method' not found in header.");
+            $this->line('Headers (normalized): '.implode(' | ', $normHeaders));
             return self::FAILURE;
         }
 
-        $made  = 0;
-        $skips = 0;
-        $rowsParsed = 0;
+        /** -------------------------------------------------------------
+         * 6) Row parsing helpers
+         * ------------------------------------------------------------ */
+        $truthy = function ($v): bool {
+            if (is_bool($v)) return $v;
+            $s = strtoupper(trim((string)$v));
+            return in_array($s, ['1','Y','YES','TRUE','T','✔','✓','ALLOW','SUPPORTED'], true);
+        };
+        $toFloat = function ($v): ?float {
+            if ($v === null || $v === '') return null;
+            $s = str_replace(',', '.', (string) $v);
+            return is_numeric($s) ? (float) $s : null;
+        };
 
-        $aliasStats = [];
+        /** -------------------------------------------------------------
+         * 7) Build exclude rules for unsupported facets
+         * ------------------------------------------------------------ */
+        $created = 0;
+        $priorityBase = 100;
 
-        // Iterate rows
-        foreach ($active as $r) {
-            $rowsParsed++;
+        DB::beginTransaction();
+        try {
+            $total = count($rows);
 
-            $mmcLabel = (string)($r[$idx['mmc_method']] ?? '');
-            [$systemId, $systemCode] = $this->resolveSystemIdAndCode($mmcLabel);
+            for ($r = 2; $r <= $total; $r++) {
+                $row = array_values($rows[$r] ?? []);
+                if (!isset($row[0])) continue;
 
-            if (!$systemId) {
-                $this->warn("Skip row #{$rowsParsed}: unknown system for MMC Method '{$mmcLabel}'");
-                $skips++;
-                continue;
-            }
-            $aliasStats[$systemCode] = true;
+                $method = trim((string) ($row[$idx['mmc_method']] ?? ''));
+                if ($method === '') continue;
 
-            // Pull tri-state flags
-            $flags = $this->extractFlagValues($r, $idx);
-
-            // Special: Telescopic Crane empty cells for LGS/ICF must be bypassed (no rule)
-            if (array_key_exists('telescopic_crane', $flags)) {
-                $isEmpty = is_null($flags['telescopic_crane']);
-                if ($isEmpty && in_array(strtoupper($systemCode), ['LGS', 'ICF'], true)) {
-                    unset($flags['telescopic_crane']); // bypass
+                // Resolve system_code (and system_id if you have a systems table)
+                $systemCode = $this->methodToSystem[$method] ?? Str::upper(Str::slug($method));
+                $systemId = null;
+                if (class_exists(\App\Models\System::class)) {
+                    $sys = \App\Models\System::where('code', $systemCode)->first();
+                    $systemId = $sys?->id;
                 }
-            }
 
-            // Optional numeric constraints
-            $constraints = $this->extractConstraints($r, $idx);
+                $p = $priorityBase;
 
-            // We only WRITE rules for explicit FALSE (meaning “excluded”)
-            $toWrite = [];
-            foreach ($flags as $key => $value) {
-                if ($value === false) {
-                    $toWrite[] = $key;
-                }
-            }
-
-            if (empty($toWrite)) {
-                continue;
-            }
-
-            if ($dryRun) {
-                foreach ($toWrite as $flag) {
-                    $this->line("DRY-RUN would EXCLUDE {$systemCode} for {$flag}");
-                }
-                $made += count($toWrite);
-                continue;
-            }
-
-            // Persist
-            DB::transaction(function () use ($dataset, $module, $priority, $prefix, $systemId, $systemCode, $toWrite, $constraints, &$made) {
-                foreach ($toWrite as $flag) {
-                    $payload = [
-                        'system_code'  => $systemCode,
-                        'flag'         => $flag,
-                        'value'        => false,
-                    ];
-                    if (!empty($constraints)) {
-                        $payload['constraints'] = $constraints;
+                // 1) Residential type → exclude when unsupported
+                $resKeys = [
+                    'low'    => $idx['low_rise'],
+                    'medium' => $idx['medium_rise'],
+                    'high'   => $idx['high_rise'],
+                ];
+                foreach ($resKeys as $enum => $i) {
+                    if ($i === null) continue;
+                    if (!$truthy($row[$i] ?? null)) {
+                        $this->insertRule($dv->id, $systemId, $systemCode, 'exclude', $p += 10, [
+                            'residential_type' => ['eq' => $enum],
+                        ], "Not suitable for ".ucfirst($enum)." rise");
+                        $created++;
                     }
-
-                    Rule::create([
-                        'dataset_version_id' => $dataset->id,
-                        'module'             => $module,
-                        'system_id'          => $systemId,
-                        'system_code'        => $systemCode,
-                        'rule_type'          => 'exclude',
-                        'conditions_json'    => $payload,
-                        'reason'             => trim(($prefix ? "{$prefix} " : '') . "{$systemCode} excluded for " . $this->prettyFlag($flag)),
-                        'priority'           => $priority,
-                    ]);
-                    $made++;
                 }
-            });
+
+                // 2) Storage (multi)
+                $storageMap = [
+                    'on-site'  => $idx['on_site_storage'],
+                    'off-site' => $idx['off_site_storage'],
+                ];
+                foreach ($storageMap as $enum => $i) {
+                    if ($i === null) continue;
+                    if (!$truthy($row[$i] ?? null)) {
+                        $this->insertRule($dv->id, $systemId, $systemCode, 'exclude', $p += 10, [
+                            'storage_types' => ['contains' => $enum],
+                        ], ucfirst(str_replace('-', ' ', $enum)).' storage not supported');
+                        $created++;
+                    }
+                }
+
+                // 3) Crane (multi)
+                $craneMap = [
+                    'tower_crane'      => $idx['tower_crane'],
+                    'telescopic_crane' => $idx['telescopic_crane'],
+                    'telehandler'      => $idx['telehandler_crane'],
+                ];
+                foreach ($craneMap as $enum => $i) {
+                    if ($i === null) continue;
+                    if (!$truthy($row[$i] ?? null)) {
+                        $this->insertRule($dv->id, $systemId, $systemCode, 'exclude', $p += 10, [
+                            'machinery' => ['contains' => $enum],
+                        ], Str::of($enum)->replace('_', ' ')->title().' not supported');
+                        $created++;
+                    }
+                }
+
+                // 4) Truck (multi)
+                $truckMap = [
+                    'flatbed_truck'    => $idx['flatbed_truck'],
+                    'flatbed_a_frame'  => $idx['flatbed_a_frame'],
+                ];
+                foreach ($truckMap as $enum => $i) {
+                    if ($i === null) continue;
+                    if (!$truthy($row[$i] ?? null)) {
+                        $this->insertRule($dv->id, $systemId, $systemCode, 'exclude', $p += 10, [
+                            'truck_types' => ['contains' => $enum],
+                        ], Str::of($enum)->replace('_', ' ')->title().' not supported');
+                        $created++;
+                    }
+                }
+
+                // 5) Panel height band — if max <= 3.0 → exclude when user picks > 3.0m
+                $panelMax = $toFloat($row[$idx['max_panel_height_m']] ?? null);
+                if ($panelMax !== null && $panelMax <= 3.0) {
+                    $this->insertRule($dv->id, $systemId, $systemCode, 'exclude', $p += 10, [
+                        'panel_height_band' => ['eq' => '>3.0m'],
+                    ], 'Panel height > 3.0 m not supported');
+                    $created++;
+                }
+
+                // 6) Frame length band — if max < 12.0 → exclude when user picks > 12.0m
+                $lenMax = $toFloat($row[$idx['max_frame_length_m']] ?? null);
+                if ($lenMax !== null && $lenMax < 12.0) {
+                    $this->insertRule($dv->id, $systemId, $systemCode, 'exclude', $p += 10, [
+                        'max_frame_length_band' => ['eq' => '>12.0m'],
+                    ], 'Frame length > 12.0 m not supported');
+                    $created++;
+                }
+
+                // 7) Frame width bands — explicit booleans
+                $le = $this->toBool($row[$idx['max_frame_width_le_3_2_m']] ?? null);
+                $gt = $this->toBool($row[$idx['max_frame_width_gt_3_2_m']] ?? null);
+
+                if ($gt === false) {
+                    $this->insertRule($dv->id, $systemId, $systemCode, 'exclude', $p += 10, [
+                        'max_frame_width_band' => ['eq' => '>3.2m'],
+                    ], 'Frame width > 3.2 m not supported');
+                    $created++;
+                }
+                if ($le === false) {
+                    $this->insertRule($dv->id, $systemId, $systemCode, 'exclude', $p += 10, [
+                        'max_frame_width_band' => ['eq' => '<=3.2m'],
+                    ], 'Frame width ≤ 3.2 m not supported');
+                    $created++;
+                }
+            }
+
+            DB::commit();
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            $this->error($e->getMessage());
+            return self::FAILURE;
         }
 
-        $codes = implode(', ', array_keys($aliasStats));
-        $this->info("Parsed rows: {$rowsParsed}. Wrote EXCLUDE rules: {$made}. Systems seen: {$codes}");
-
+        $this->info("Imported {$created} exclude rules into dataset_version #{$dv->id} ({$labelForLog}).");
+        $this->line('Publish with your "Make current" UI when ready.');
         return self::SUCCESS;
     }
 
-    /* ------------------------------ Helpers ------------------------------ */
-
-    protected function normalizeHeader(?string $v): string
-    {
-        $v = (string)$v;
-        $v = trim(strtolower($v));
-        $v = str_replace(['—', '–', '−'], '-', $v); // normalize dashes
-        $v = preg_replace('/\s+/', ' ', $v);        // collapse spaces
-        $v = preg_replace('/[^a-z0-9\.\-\s_]/i', '_', $v);
-        $v = str_replace(' ', '_', $v);
-        return $v;
+    private function insertRule(
+        int $datasetVersionId,
+        ?int $systemId,
+        string $systemCode,
+        string $ruleType,
+        int $priority,
+        array $conditions,
+        string $reason
+    ): void {
+        Rule::create([
+            'dataset_version_id' => $datasetVersionId,
+            'module'             => 'viability',
+            'system_id'          => $systemId,          // nullable if your schema allows
+            'system_code'        => $systemCode,
+            'rule_type'          => $ruleType,          // 'exclude' or 'include'
+            'priority'           => $priority,
+            'conditions_json'    => $conditions,        // your column name
+            'reason'             => $reason,
+        ]);
     }
 
-    protected function findHeaderIndex(array $headers, array $candidates): ?int
+    /** Normalize header strings (lowercase, remove spaces/punct, replace locale commas) */
+    private function norm(?string $s): string
     {
-        foreach ($candidates as $c) {
-            $key = $this->normalizeHeader($c);
-            $i = array_search($key, $headers, true);
-            if ($i !== false) return $i;
-        }
+        $s = (string) $s;
+        $s = strtr($s, [',' => '_', '’' => "'", '–'=>'-','—'=>'-','/'=>'_','\\'=>'_','('=>'',')'=>'','.'=>'','+'=>' plus ']);
+        $s = preg_replace('/\s+/', '_', trim($s));
+        $s = preg_replace('/[^a-zA-Z0-9_]/', '', $s);
+        return strtolower($s);
+    }
+
+    private function toBool($v): ?bool
+    {
+        if ($v === null || $v === '') return null;
+        $s = strtoupper(trim((string)$v));
+        if (in_array($s, ['1','Y','YES','TRUE','T','✔','✓','ALLOW','SUPPORTED'], true)) return true;
+        if (in_array($s, ['0','N','NO','FALSE','F','✘','X','✗','UNSUPPORTED'], true)) return false;
         return null;
     }
 
-    protected function findHeaderIndexLike(array $headers, string $pattern): ?int
+    private function resolvePath(string $pathOpt): string
     {
-        foreach ($headers as $i => $h) {
-            if (preg_match($pattern, $h)) return $i;
+        // absolute inside container
+        if ($pathOpt && str_starts_with($pathOpt, '/')) {
+            return $pathOpt;
         }
-        return null;
-    }
-
-    protected function resolveSystemIdAndCode(?string $mmcMethod): array
-    {
-        $label = strtoupper(trim((string)$mmcMethod));
-        if ($label === '') return [null, null];
-
-        // alias map: label -> code
-        $aliases = [
-            'CONCRETE BLOCK'         => 'BLOCK',
-            'BLOCK'                  => 'BLOCK',
-            'MASONRY'                => 'BLOCK',
-            'TIMBER FRAME'           => 'TF',
-            'TIMBERFRAME'            => 'TF',
-            'TF'                     => 'TF',
-            'LGS'                    => 'LGS',
-            'LIGHT GAUGE STEEL'      => 'LGS',
-            'LIGHT-GAUGE STEEL'      => 'LGS',
-            'LIGHT GAUGE STEEL (LGS)'=> 'LGS',
-            'ICF'                    => 'ICF',
-            'INSULATED CONCRETE FORMWORK' => 'ICF',
-        ];
-
-        // Handle labels like "LGS (Light Gauge Steel)" etc.
-        if (preg_match('/\bLGS\b/i', $label)) $aliases[$label] = 'LGS';
-        if (preg_match('/\bTF\b/i', $label))  $aliases[$label] = 'TF';
-        if (preg_match('/\bICF\b/i', $label)) $aliases[$label] = 'ICF';
-
-        $code = $aliases[$label] ?? $label;
-
-        // try by code
-        $system = System::where('code', $code)->first();
-        if (!$system) {
-            // try exact name, then LIKE
-            $system = System::whereRaw('upper(name) = ?', [$label])->first()
-                   ?: System::whereRaw('upper(name) like ?', ['%'.$label.'%'])->first();
-        }
-
-        return [$system?->id, $system?->code ?? $code];
-    }
-
-    protected function coerceTri($val): ?bool
-    {
-        // 1) direct booleans
-        if (is_bool($val)) {
-            return $val; // true/false as-is
-        }
-
-        // 2) numeric (Excel may coerce TRUE/FALSE to 1/0)
-        if (is_int($val) || is_float($val)) {
-            if ($val === 1 || $val === 1.0) return true;
-            if ($val === 0 || $val === 0.0) return false;
-            // other numerics treated as truthy
-            return $val ? true : null;
-        }
-
-        // 3) strings and everything else
-        if ($val === null) return null;
-        $v = trim((string)$val);
-        if ($v === '') return null;
-
-        $vu = strtoupper($v);
-        // common true-ish
-        if (in_array($vu, ['Y','YES','TRUE','T','1'], true)) return true;
-        // common false-ish
-        if (in_array($vu, ['N','NO','FALSE','F','0'], true)) return false;
-
-        return null;
-    }
-
-    protected function extractFlagValues(array $row, array $idx): array
-    {
-        $out = [];
-        $keys = [
-            'low_rise','medium_rise','high_rise',
-            'on_site_storage','off_site_storage',
-            'tower_crane','telescopic_crane','telehandler_crane',
-            'flatbed_truck','flatbed_a_frame',
-        ];
-        foreach ($keys as $k) {
-            if ($idx[$k] !== null) {
-                $out[$k] = $this->coerceTri($row[$idx[$k]] ?? null);
-            }
-        }
-        return $out;
-    }
-
-    protected function extractConstraints(array $row, array $idx): array
-    {
-        $c = [];
-        $num = function ($v) {
-            if ($v === null || $v === '') return null;
-            $v = str_replace(',', '.', (string)$v);
-            return is_numeric($v) ? (float)$v : null;
-        };
-
-        $map = [
-            'max_panel_height_m',
-            'max_frame_length_m',
-            'max_frame_width_lt_3_2_m',
-            'max_frame_width_gt_3_2_m',
-        ];
-
-        foreach ($map as $key) {
-            if ($idx[$key] !== null) {
-                $val = $num($row[$idx[$key]] ?? null);
-                if ($val !== null) $c[$key] = $val;
-            }
-        }
-        return $c;
-    }
-
-    protected function prettyFlag(string $flag): string
-    {
-        $map = [
-            'low_rise'                  => 'Low Rise',
-            'medium_rise'               => 'Medium Rise',
-            'high_rise'                 => 'High Rise',
-            'on_site_storage'           => 'On Site Storage',
-            'off_site_storage'          => 'Off Site Storage',
-            'tower_crane'               => 'Tower Crane',
-            'telescopic_crane'          => 'Telescopic Crane',
-            'telehandler_crane'         => 'Telehandler Crane',
-            'flatbed_truck'             => 'Flatbed Truck',
-            'flatbed_a_frame'           => 'Flatbed A Frame',
-        ];
-        return $map[$flag] ?? $flag;
+        // treat as storage/app/public relative (how uploads are stored)
+        return storage_path('app/public/'.ltrim($pathOpt, '/'));
     }
 }

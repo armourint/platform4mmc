@@ -1,22 +1,31 @@
 <div class="mx-auto max-w-6xl space-y-6">
+  <!-- Page Title and Total Count -->
   <div class="flex items-center justify-between">
-    <h1 class="text-2xl font-semibold">Knowledge Bank</h1>
-    <div class="text-sm text-gray-600">Total items: {{ $total ?? 0 }}</div>
+    <h1 class="text-2xl font-semibold">Knowledge Hub</h1>
+    <div class="text-sm text-gray-600">Total articles: {{ $total }}</div>
   </div>
 
-  {{-- Search & filters --}}
+  <!-- Search and Category Filter Form -->
   <form wire:submit.prevent="search" class="rounded-xl border bg-white p-4">
     <div class="grid gap-3 md:grid-cols-3">
+      <!-- Search field -->
       <div class="md:col-span-2">
         <label class="block text-sm font-medium">Search</label>
-        <input type="text" wire:model.defer="q" class="mt-1 w-full rounded border px-3 py-2" placeholder="Keywords, title, body…">
+        <input type="text" wire:model.defer="q" 
+               class="mt-1 w-full rounded border px-3 py-2"
+               placeholder="Keywords in title or body..." />
       </div>
+      <!-- Category filter field -->
       <div>
-        <label class="block text-sm font-medium">Type</label>
-        <select wire:model.defer="type" class="mt-1 w-full rounded border px-3 py-2">
-          <option value="">All</option>
-          @foreach(($types ?? []) as $t)
-            <option value="{{ $t }}" @selected($type === $t)>{{ ucfirst(str_replace('_',' ', $t)) }}</option>
+        <label class="block text-sm font-medium">Category</label>
+        <select wire:model.defer="categoryId" class="mt-1 w-full rounded border px-3 py-2">
+          <option value="">All Categories</option>
+          @foreach ($categories->groupBy('type') as $type => $group)
+            <optgroup label="{{ ucfirst($type) ?: 'Other' }}">
+              @foreach ($group as $cat)
+                <option value="{{ $cat->id }}">{{ $cat->name }}</option>
+              @endforeach
+            </optgroup>
           @endforeach
         </select>
       </div>
@@ -26,58 +35,59 @@
     </div>
   </form>
 
-  {{-- Results list --}}
+  <!-- Results List -->
   <div class="rounded-xl border bg-white">
-    @if(($items ?? collect())->isEmpty())
-      <div class="p-6 text-sm text-gray-600">No results found.</div>
+    @if ($articles->isEmpty())
+      <div class="p-6 text-sm text-gray-600">No articles found.</div>
     @else
       <ul class="divide-y">
-        @foreach($items as $item)
+        @foreach ($articles as $article)
           <li class="p-4">
             <div class="flex items-start justify-between gap-4">
-              <div>
-                <div class="text-base font-medium">{{ $item->title }}</div>
+              <div class="flex-1">
+                <!-- Article Title -->
+                <div class="text-base font-medium">{{ $article->title }}</div>
+                <!-- Article excerpt/snippet -->
                 <div class="mt-1 text-sm text-gray-600">
-                  {{ \Illuminate\Support\Str::limit($item->excerpt ?? strip_tags($item->body ?? ''), 160) }}
+                  {{ \Illuminate\Support\Str::limit(strip_tags($article->body), 160) }}
                 </div>
+                <!-- Meta info: categories and date -->
                 <div class="mt-2 flex flex-wrap gap-2 text-xs text-gray-500">
-                  @if(!empty($item->type))
-                    <span class="rounded border px-2 py-0.5">{{ ucfirst(str_replace('_',' ', $item->type)) }}</span>
-                  @endif
-                  @if(!empty($item->source))
-                    <span class="rounded border px-2 py-0.5">Source: {{ $item->source }}</span>
-                  @endif
-                  @if(!empty($item->published_at))
-                    <span class="rounded border px-2 py-0.5">{{ \Illuminate\Support\Carbon::parse($item->published_at)->toDateString() }}</span>
+                  @foreach ($article->categories as $cat)
+                    <span class="rounded border px-2 py-0.5">
+                      {{ $cat->name }} @if($cat->type) ({{ ucfirst($cat->type) }}) @endif
+                    </span>
+                  @endforeach
+                  @if ($article->published_at)
+                    <span class="rounded border px-2 py-0.5">
+                      {{ $article->published_at->toDateString() }}
+                    </span>
                   @endif
                 </div>
               </div>
-              <div class="shrink-0">
-                @if(!empty($item->url))
-                  <a href="{{ $item->url }}" target="_blank" rel="noopener" class="text-sm text-blue-700 underline">Open</a>
-                @else
-                  <a href="{{ route('knowledge.index') }}?view={{ $item->id }}" class="text-sm text-blue-700 underline">View</a>
-                @endif
+              <!-- View Article Link -->
+              <div class="shrink-0 self-center">
+                <a href="{{ route('knowledge.show', $article->slug) }}" 
+                   class="text-sm text-blue-700 underline">Read More</a>
               </div>
             </div>
           </li>
         @endforeach
       </ul>
-
-      {{-- Pagination --}}
+      <!-- Pagination controls -->
       <div class="flex items-center justify-between border-t p-3 text-sm">
-        <div>Showing {{ $items->firstItem() }}–{{ $items->lastItem() }} of {{ $items->total() }}</div>
+        <div>Showing {{ $articles->firstItem() }}–{{ $articles->lastItem() }} of {{ $articles->total() }}</div>
         <div class="flex gap-2">
-          @if($items->onFirstPage())
-            <span class="cursor-not-allowed rounded border px-3 py-1 text-gray-400">Prev</span>
+          @if($articles->onFirstPage())
+            <span class="px-3 py-1 text-gray-400">Prev</span>
           @else
-            <button wire:click="gotoPage({{ $items->currentPage() - 1 }})" class="rounded border px-3 py-1">Prev</button>
+            <button wire:click="previousPage" class="px-3 py-1 border rounded">Prev</button>
           @endif
 
-          @if($items->hasMorePages())
-            <button wire:click="gotoPage({{ $items->currentPage() + 1 }})" class="rounded border px-3 py-1">Next</button>
+          @if($articles->hasMorePages())
+            <button wire:click="nextPage" class="px-3 py-1 border rounded">Next</button>
           @else
-            <span class="cursor-not-allowed rounded border px-3 py-1 text-gray-400">Next</span>
+            <span class="px-3 py-1 text-gray-400">Next</span>
           @endif
         </div>
       </div>

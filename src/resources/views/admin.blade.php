@@ -95,6 +95,16 @@
           Imports
         </a>
       @endif
+
+
+      @if (Route::has('admin.knowledge.index'))
+        <a href="{{ route('admin.knowledge.index') }}"
+           class="px-3 py-1.5 rounded-md text-sm font-medium border
+                  {{ request()->routeIs('admin.knowledge.index') ? 'bg-blue-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-50' }}">
+          Knowledge
+        </a>
+      @endif
+
     </div>
 
     {{-- Livewire pages render here when ->layout('admin') is used --}}

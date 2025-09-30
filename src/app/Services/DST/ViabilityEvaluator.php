@@ -4,198 +4,284 @@ namespace App\Services\DST;
 
 use App\Models\DatasetVersion;
 use App\Models\Rule;
-use App\Models\System;
+use Illuminate\Support\Arr;
 
-final class ViabilityEvaluator
+/**
+ * ViabilityEvaluator
+ *
+ * Usage:
+ *   $result = app(ViabilityEvaluator::class)->evaluate($inputs, $datasetVersion);
+ *
+ * $inputs is the normalized array from the Viability Wizard, e.g.:
+ * [
+ *   'residential_type'       => 'low|medium|high',
+ *   'storage_types'          => ['on-site','off-site'],
+ *   'machinery'              => ['tower_crane','telescopic_crane','telehandler'],
+ *   'truck_types'            => ['flatbed_truck','flatbed_a_frame'],
+ *   'panel_height_band'      => '<=3.0m' | '>3.0m',
+ *   'max_frame_length_band'  => '<=12.0m' | '>12.0m',
+ *   'max_frame_width_band'   => '<=3.2m' | '>3.2m',
+ *   // legacy numeric proxies also OK: panel_height_m, max_frame_length_m, max_frame_width_m
+ * ]
+ */
+class ViabilityEvaluator
 {
     /**
-     * Evaluate viability against the given dataset version.
+     * Evaluate rules for a given dataset version.
      *
-     * @param  array $inputs  // expected keys: residential_type, storage_type, machinery[], stories, height_m, res_units, commercial_units, storage_space_m2,
-     *                        // tower_crane_capacity_t, telescopic_crane_capacity_t, telehandler_capacity_t
-     * @param  \App\Models\DatasetVersion $dv
-     * @return array{
-     *   per_system: array<string, array{ok: bool, failed: array<int, array{reason: string, rule_id:int|null}>}>,
-     *   includes_count: array<string,int>,
-     *   excludes_count: array<string,int>
-     * }
+     * Returns:
+     * [
+     *   'summary' => [
+     *       'include_count' => int,
+     *       'exclude_count' => int,
+     *       'status'        => 'OK'|'Attention'|'Excluded', // global status (simple heuristic)
+     *   ],
+     *   'systems' => [
+     *       'BLOCK' => ['status' => 'included'|'excluded', 'reasons' => ['...','...']],
+     *       'LGS'   => ['status' => 'included'|'excluded', 'reasons' => [...]],
+     *       ...
+     *   ],
+     *   'matched_rules' => [
+     *       'BLOCK' => [ ['id'=>..., 'type'=>'exclude', 'reason'=>'...'], ... ],
+     *       ...
+     *   ],
+     * ]
      */
     public function evaluate(array $inputs, DatasetVersion $dv): array
     {
-        $ctx = $this->normalizeInputs($inputs);
-
-        // Load systems and rules for this dataset
-        $systems = System::query()->get(['id','code','name'])->keyBy('id');
-        $rules   = Rule::query()
+        // Fetch all rules for this dataset version.
+        // Do NOT explicitly select a non-existent 'conditions' column.
+        $rules = Rule::query()
             ->where('dataset_version_id', $dv->id)
             ->orderByDesc('priority')
-            ->get(['id','system_id','rule_type','conditions','reason']);
+            ->get(); // conditions_json is exposed as $rule->conditions via your accessor
 
-        // Initialize all systems as viable until proven otherwise
-        $perSystem     = [];
-        $includesCount = [];
-        $excludesCount = [];
-
-        foreach ($systems as $sysId => $sys) {
-            $perSystem[$sys->code]     = ['ok' => true, 'failed' => []];
-            $includesCount[$sys->code] = 0;
-            $excludesCount[$sys->code] = 0;
+        // Group rules by system_code
+        $bySystem = [];
+        foreach ($rules as $rule) {
+            $code = $rule->system_code ?: 'UNKNOWN';
+            $bySystem[$code][] = $rule;
         }
 
-        foreach ($rules as $rule) {
-            $sys = $systems[$rule->system_id] ?? null;
-            if (!$sys) {
-                continue;
+        $systemsOut     = [];
+        $matchedOut     = [];
+        $includeCount   = 0;
+        $excludeCount   = 0;
+
+        foreach ($bySystem as $systemCode => $systemRules) {
+            $reasons = [];
+            $excluded = false;
+
+            // Our current importer generates EXCLUDE rules for unsupported facets.
+            // If any EXCLUDE rule's conditions match the inputs => system excluded.
+            foreach ($systemRules as $rule) {
+                $conditions = $rule->conditions ?? []; // virtual attribute maps to conditions_json
+                if ($this->conditionsMatch($conditions, $inputs)) {
+                    if (strtolower($rule->rule_type) === 'exclude') {
+                        $excluded = true;
+                    }
+                    $reasons[] = $rule->reason ?: 'Rule matched';
+                    $matchedOut[$systemCode][] = [
+                        'id'     => $rule->id,
+                        'type'   => strtolower($rule->rule_type),
+                        'reason' => $rule->reason,
+                    ];
+                }
             }
 
-            $conditions = $this->decode($rule->conditions);
-
-            // Treat null or {} conditions as "always matches".
-            $matches = $this->matches($conditions, $ctx);
-
-            if (!$matches) {
-                continue;
-            }
-
-            if ($rule->rule_type === 'include') {
-                $includesCount[$sys->code] = ($includesCount[$sys->code] ?? 0) + 1;
-                // We keep default as ok=true; include is informative.
-                continue;
-            }
-
-            if ($rule->rule_type === 'exclude') {
-                $excludesCount[$sys->code] = ($excludesCount[$sys->code] ?? 0) + 1;
-                $perSystem[$sys->code]['ok'] = false;
-                $perSystem[$sys->code]['failed'][] = [
-                    'reason'  => $rule->reason ?: 'Rule excluded this system.',
-                    'rule_id' => $rule->id,
+            if ($excluded) {
+                $systemsOut[$systemCode] = [
+                    'status'  => 'excluded',
+                    'reasons' => array_values(array_unique($reasons)),
                 ];
+                $excludeCount++;
+            } else {
+                $systemsOut[$systemCode] = [
+                    'status'  => 'included',
+                    'reasons' => array_values(array_unique($reasons)), // might be empty
+                ];
+                $includeCount++;
             }
+        }
+
+        // If there are no rules at all for this dataset, treat as all-included (defensive)
+        if (empty($systemsOut)) {
+            $systemsOut['(no-rules)'] = [
+                'status'  => 'included',
+                'reasons' => ['No rules present in dataset.'],
+            ];
+            $includeCount = 1;
+        }
+
+        // Simple global status heuristic for the chip:
+        // - If all excluded => 'Excluded'
+        // - If some excluded and some included => 'Attention'
+        // - If none excluded => 'OK'
+        $globalStatus = 'OK';
+        if ($excludeCount > 0 && $includeCount > 0) {
+            $globalStatus = 'Attention';
+        } elseif ($excludeCount > 0 && $includeCount === 0) {
+            $globalStatus = 'Excluded';
         }
 
         return [
-            'per_system'      => $perSystem,
-            'includes_count'  => $includesCount,
-            'excludes_count'  => $excludesCount,
+            'summary' => [
+                'include_count' => $includeCount,
+                'exclude_count' => $excludeCount,
+                'status'        => $globalStatus,
+            ],
+            'systems'       => $systemsOut,
+            'matched_rules' => $matchedOut,
         ];
     }
 
-    private function decode($json): array
-    {
-        if (is_array($json)) return $json;
-        if (!$json) return [];
-        try {
-            $arr = json_decode($json, true, 512, JSON_THROW_ON_ERROR);
-            return is_array($arr) ? $arr : [];
-        } catch (\Throwable $e) {
-            return [];
-        }
-    }
-
     /**
-     * Normalize wizard inputs for consistent matching.
-     */
-    private function normalizeInputs(array $in): array
-    {
-        $out = $in;
-
-        foreach (['residential_type','storage_type','ber_rating'] as $k) {
-            if (isset($out[$k]) && is_string($out[$k])) {
-                $out[$k] = mb_strtolower($out[$k]);
-            }
-        }
-
-        // Ensure machinery is an array of strings
-        $mach = $out['machinery'] ?? [];
-        if (!is_array($mach)) $mach = [];
-        $mach = array_values(array_unique(array_map(fn($v) => is_string($v) ? mb_strtolower($v) : $v, $mach)));
-        $out['machinery'] = $mach;
-
-        // Coerce numbers
-        foreach ([
-            'stories','height_m','res_units','commercial_units','storage_space_m2',
-            'tower_crane_capacity_t','telescopic_crane_capacity_t','telehandler_capacity_t',
-        ] as $numKey) {
-            if (isset($out[$numKey])) {
-                $out[$numKey] = is_numeric($out[$numKey]) ? $out[$numKey] + 0 : null;
-            }
-        }
-
-        // Boolean
-        if (array_key_exists('has_commercial', $out)) {
-            $out['has_commercial'] = (bool) $out['has_commercial'];
-        }
-
-        return $out;
-    }
-
-    /**
-     * Evaluate a rule's conditions object against the context.
+     * Determine if a conditions JSON object matches the given inputs.
+     *
      * Supported operators:
-     *   eq, ne, in, not_in, lte, gte, contains, contains_any, contains_all
+     *  - Scalars: eq, ne, in, not_in, gte, lte
+     *  - Arrays:  contains, contains_any, contains_all
+     *
+     * The $conditions should be a flat JSON object where each key corresponds
+     * to an input key, and its value is either a scalar test or an object of operators.
+     *
+     * Examples:
+     *  { "residential_type": {"eq":"low"} }
+     *  { "storage_types": {"contains":"off-site"} }
+     *  { "machinery": {"contains_any":["tower_crane","telescopic_crane"]} }
+     *  { "panel_height_band": {"eq":">3.0m"} }
      */
-    private function matches(array $conditions, array $ctx): bool
+    protected function conditionsMatch(?array $conditions, array $inputs): bool
     {
-        if ($conditions === []) {
-            // Unconditional: matches everything
-            return true;
-        }
+        $conditions = $conditions ?? [];
 
-        foreach ($conditions as $key => $cond) {
-            // Ignore non-input keys that sometimes appear in imported data
-            if (in_array($key, ['system_code','value','constraints'], true)) {
+        foreach ($conditions as $key => $test) {
+            // If the rule references an input we don't have, treat it as non-match.
+            if (!Arr::has($inputs, $key)) {
+                return false;
+            }
+
+            $inputVal = Arr::get($inputs, $key);
+
+            // If the condition is a plain scalar, treat as eq
+            if (!is_array($test)) {
+                if (!$this->opEq($inputVal, $test)) {
+                    return false;
+                }
                 continue;
             }
 
-            $lhs = $ctx[$key] ?? null;
+            // Otherwise it's an operator set
+            foreach ($test as $op => $expected) {
+                $op = strtolower((string) $op);
 
-            if (is_array($cond)) {
-                foreach ($cond as $op => $rhs) {
-                    if (!$this->matchOne($lhs, $op, $rhs)) {
-                        return false;
+                // Array-ops expect the input to be an array
+                if (in_array($op, ['contains','contains_any','contains_all'], true)) {
+                    $inputArr = is_array($inputVal) ? $inputVal : [$inputVal];
+                    if ($op === 'contains') {
+                        if (!$this->opContains($inputArr, $expected)) return false;
+                    } elseif ($op === 'contains_any') {
+                        if (!$this->opContainsAny($inputArr, (array) $expected)) return false;
+                    } elseif ($op === 'contains_all') {
+                        if (!$this->opContainsAll($inputArr, (array) $expected)) return false;
                     }
+                    continue;
                 }
-            } else {
-                // Shorthand equality: { key: "value" }
-                if (!$this->matchOne($lhs, 'eq', $cond)) {
-                    return false;
+
+                // Scalar ops
+                switch ($op) {
+                    case 'eq':
+                        if (!$this->opEq($inputVal, $expected)) return false;
+                        break;
+                    case 'ne':
+                        if ($this->opEq($inputVal, $expected)) return false;
+                        break;
+                    case 'in':
+                        if (!$this->opIn($inputVal, (array) $expected)) return false;
+                        break;
+                    case 'not_in':
+                        if ($this->opIn($inputVal, (array) $expected)) return false;
+                        break;
+                    case 'gte':
+                        if (!$this->opGte($inputVal, $expected)) return false;
+                        break;
+                    case 'lte':
+                        if (!$this->opLte($inputVal, $expected)) return false;
+                        break;
+                    default:
+                        // Unknown operator -> treat as non-match to be safe
+                        return false;
                 }
             }
         }
+
         return true;
     }
 
-    private function matchOne($lhs, string $op, $rhs): bool
+    /* ---------------------- Operator helpers ---------------------- */
+
+    protected function opEq($actual, $expected): bool
     {
-        switch ($op) {
-            case 'eq':
-                return $lhs === $rhs;
-            case 'ne':
-                return $lhs !== $rhs;
-            case 'in':
-                return is_array($rhs) ? in_array($lhs, $rhs, true) : false;
-            case 'not_in':
-                return is_array($rhs) ? !in_array($lhs, $rhs, true) : true;
-            case 'lte':
-                return (is_numeric($lhs) && is_numeric($rhs)) ? ($lhs <= $rhs) : false;
-            case 'gte':
-                return (is_numeric($lhs) && is_numeric($rhs)) ? ($lhs >= $rhs) : false;
-            case 'contains':
-                // array contains scalar
-                return is_array($lhs) ? in_array($rhs, $lhs, true) : false;
-            case 'contains_any':
-                return is_array($lhs) && is_array($rhs)
-                    ? (bool) array_intersect($lhs, $rhs)
-                    : false;
-            case 'contains_all':
-                if (!is_array($lhs) || !is_array($rhs)) return false;
-                foreach ($rhs as $needle) {
-                    if (!in_array($needle, $lhs, true)) return false;
-                }
-                return true;
-            default:
-                // Unknown operator -> fail-safe to false so bad data doesn't match unexpectedly
-                return false;
+        // Normalize strings case-insensitively for enums like 'low', 'on-site'
+        if (is_string($actual) && is_string($expected)) {
+            return strcmp(mb_strtolower($actual), mb_strtolower($expected)) === 0;
         }
+        return $actual === $expected;
+    }
+
+    protected function opIn($actual, array $set): bool
+    {
+        if (is_string($actual)) {
+            $set = array_map(fn($v) => is_string($v) ? mb_strtolower($v) : $v, $set);
+            return in_array(mb_strtolower($actual), $set, true);
+        }
+        return in_array($actual, $set, true);
+    }
+
+    protected function opGte($actual, $threshold): bool
+    {
+        $a = is_numeric($actual) ? (float) $actual : null;
+        $t = is_numeric($threshold) ? (float) $threshold : null;
+        return $a !== null && $t !== null && $a >= $t;
+    }
+
+    protected function opLte($actual, $threshold): bool
+    {
+        $a = is_numeric($actual) ? (float) $actual : null;
+        $t = is_numeric($threshold) ? (float) $threshold : null;
+        return $a !== null && $t !== null && $a <= $t;
+    }
+
+    protected function opContains(array $haystack, $needle): bool
+    {
+        if (is_string($needle)) {
+            foreach ($haystack as $h) {
+                if (is_string($h) && mb_strtolower($h) === mb_strtolower($needle)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return in_array($needle, $haystack, true);
+    }
+
+    protected function opContainsAny(array $haystack, array $needles): bool
+    {
+        foreach ($needles as $n) {
+            if ($this->opContains($haystack, $n)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    protected function opContainsAll(array $haystack, array $needles): bool
+    {
+        foreach ($needles as $n) {
+            if (!$this->opContains($haystack, $n)) {
+                return false;
+            }
+        }
+        return true;
     }
 }

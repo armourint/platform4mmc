@@ -2,59 +2,50 @@
 
 namespace App\Livewire\Knowledge;
 
-use App\Models\Content;
-use Livewire\Attributes\Layout;
-use Livewire\WithPagination;
+use App\Models\Article;
+use App\Models\Category;
 use Livewire\Component;
+use Livewire\WithPagination;
+use Livewire\Attributes\Layout;
 
-#[Layout('layouts.app')]
+#[Layout('layouts.app')]  // use main app layout (includes header/footer)
 class Index extends Component
 {
     use WithPagination;
 
-    public string $q = '';
-    public ?string $type = null; // article|case_study|resource
+    public string $q = '';              // search query
+    public ?int $categoryId = null;     // filter by category
 
-    public function updatingQ()    { $this->resetPage(); }
-    public function updatingType() { $this->resetPage(); }
-
-    public function search(): void
-    {
-        // No-op: re-render with current filters
-    }
+    // Reset to page 1 when filters change
+    public function updatingQ()      { $this->resetPage(); }
+    public function updatingCategoryId() { $this->resetPage(); }
 
     public function render()
     {
-        $query = Content::query()
-            ->when($this->q !== '', function ($query) {
-                $q = $this->q;
-                $query->where(function ($w) use ($q) {
-                    $w->where('title', 'like', "%{$q}%")
-                      ->orWhere('excerpt', 'like', "%{$q}%")
-                      ->orWhere('body', 'like', "%{$q}%");
+        // Build query for published articles
+        $query = Article::published()
+            ->when($this->q !== '', function($q) {
+                $q->where(function($sub) {
+                    $sub->where('title', 'like', "%{$this->q}%")
+                        ->orWhere('body', 'like', "%{$this->q}%");
                 });
             })
-            ->when(!empty($this->type), fn ($q) => $q->where('type', $this->type));
+            ->when($this->categoryId, function($q) {
+                $q->whereHas('categories', fn($sub) => $sub->where('categories.id', $this->categoryId));
+            })
+            ->orderBy('published_at', 'desc')
+            ->orderBy('title');
 
-        $items = $query->orderByDesc('published_at')
-                       ->orderByDesc('id')
-                       ->paginate(12);
+        $articles = $query->paginate(10);
 
-        $total = Content::count();
-
-        // Populate the type filter from the data you actually have
-        $types = Content::query()
-            ->select('type')
-            ->whereNotNull('type')
-            ->distinct()
-            ->pluck('type')
-            ->filter()
-            ->values();
+        // Fetch categories for the filter dropdown (grouped by type)
+        $categories = Category::orderBy('type')->orderBy('name')->get();
 
         return view('livewire.knowledge.index', [
-            'items' => $items,
-            'total' => $total,
-            'types' => $types,
+            'articles'   => $articles,
+            'categories' => $categories,
+            'total'      => Article::published()->count()
         ]);
     }
 }
+
