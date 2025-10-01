@@ -32,6 +32,7 @@
           <th class="text-left px-3 py-2">Created</th>
           <th class="text-left px-3 py-2">Name</th>
           <th class="text-left px-3 py-2">Project</th>
+          <th class="px-3 py-2 text-left">Type</th> 
           <th class="text-left px-3 py-2">System</th>
           <th class="text-left px-3 py-2">Status</th>
           <th class="text-left px-3 py-2">Actions</th>
@@ -50,6 +51,14 @@
               @else
                 <span class="text-gray-400">—</span>
               @endif
+            </td>
+            <td class="px-3 py-2">
+              <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium
+                {{ $a->type === 'viability'
+                    ? 'bg-green-100 text-green-800'
+                    : 'bg-blue-100 text-blue-800' }}">
+                {{ ucfirst($a->type) }}
+              </span>
             </td>
             <td class="px-3 py-2">{{ $a->system_code ?? '—' }}</td>
             <td class="px-3 py-2">

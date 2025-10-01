@@ -57,8 +57,19 @@ class ImportEnvironmentalLayersFromExcel extends Command
 
         // Carbon
         'carbon_factor'    => ['Carbon Factor (kgCO2e/kg)','Carbon Factor','Carbon factor (kgCO2e/kg)'],
+        'carbon_factor_unit'=> ['Carbon Factor Unit','CF Unit','CF Units','Carbon Factor (unit)'],
         'a1a3_per_m2'      => ['A1–A3 (kg CO2e / m²)','A1-A3 (kgCO2e/m2)','A1A3_kgCO2e_per_m2'],
         'a1a3_per_5_76_m2' => ['A1–A3 (kg CO2e / 5.76 m²)','A1-A3 (kgCO2e / 5.76 m2)','A1A3_kgCO2e_per_5_76m2'],
+
+        // Thermal (per-layer)
+        'thermal_conductivity_w_mk' => [
+            'Thermal Conductivity (W/mK)','Thermal Conductivity (W/m·K)','Lambda (W/mK)','λ (W/mK)','k (W/mK)'
+        ],
+        'r_value_m2k_w'    => ['R-Value (m2K/W)','R Value (m²K/W)','R-Value','R (m2K/W)'],
+        'u_value_w_m2k'    => ['U-Value (W/m2K)','U Value (W/m²·K)','U-value','U (W/m2K)'],
+
+        // Durability
+        'life_expectancy_years' => ['Life Expectancy (years)','Service Life (years)','Life (years)','Life span (years)'],
 
         // A4 (handled separately if you later map to environmental_factors)
         'a4_per_m2'        => ['A4 (kgCO2e/m2)','A4 (kgCO₂e/m²)','A4_kgCO2e_per_m2'],
@@ -92,9 +103,7 @@ class ImportEnvironmentalLayersFromExcel extends Command
 
             $this->info("Imported {$total} layer rows.");
 
-            // (Optional) You can add A4 mapping into environmental_factors later if you want.
-            // For MVP we skip writing A4 rows here, since your results UI can read A4 elsewhere.
-
+            // (Optional A4 factors can be added later.)
             return self::SUCCESS;
         } catch (\Throwable $e) {
             $this->error("Import failed: {$e->getMessage()}");
@@ -130,7 +139,6 @@ class ImportEnvironmentalLayersFromExcel extends Command
         }
         if (!$headerRow) return 0;
 
-        // Build a map index => header name
         $hdr = $headerRow;
 
         // Helper to find source column by alias
@@ -162,8 +170,15 @@ class ImportEnvironmentalLayersFromExcel extends Command
         $c_mass_m2          = $col('mass_kg_m2');
 
         $c_cf               = $col('carbon_factor');
+        $c_cf_unit          = $col('carbon_factor_unit');
         $c_a1a3_m2          = $col('a1a3_per_m2');
         $c_a1a3_576         = $col('a1a3_per_5_76_m2');
+
+        // NEW thermal/durability columns
+        $c_lambda           = $col('thermal_conductivity_w_mk');
+        $c_rvalue           = $col('r_value_m2k_w');
+        $c_uvalue           = $col('u_value_w_m2k');
+        $c_life             = $col('life_expectancy_years');
 
         $insert = [];
         for ($i = $start; $i <= count($rows); $i++) {
@@ -183,7 +198,6 @@ class ImportEnvironmentalLayersFromExcel extends Command
 
             // Prefer given sheet category label, fallback to column if present
             $sys_cat      = $systemCategory ?: $this->cleanStr($get($c_system_category));
-            // Normalize common variants to your table values (Wall/Cladding/Slab)
             $sys_cat      = $this->normalizeCategory($sys_cat);
 
             // If system_code missing, try deriving from mmc_method
@@ -214,15 +228,31 @@ class ImportEnvironmentalLayersFromExcel extends Command
 
             // Carbon
             $cf           = $this->toFloat($get($c_cf));
+            $cf_unit      = $this->cleanStr($get($c_cf_unit));
             $a1a3_m2      = $this->toFloat($get($c_a1a3_m2));
             $a1a3_576     = $this->toFloat($get($c_a1a3_576));
 
-            // Sometimes A1-A3 is not given but can be computed from mass * carbon_factor
+            // If A1-A3 not given but mass & CF available, compute
             if ($a1a3_m2 === null && $mass_m2 !== null && $cf !== null) {
                 $a1a3_m2 = $mass_m2 * $cf;
             }
 
-            // Ignore header or empty garbage rows (require at least a material or role)
+            // Thermal / durability
+            $lambda_w_mk  = $this->toFloat($get($c_lambda)); // thermal conductivity
+            $r_value      = $this->toFloat($get($c_rvalue));
+            $u_value      = $this->toFloat($get($c_uvalue));
+            $life_years   = $this->toFloat($get($c_life));
+
+            // Compute missing R from thickness / lambda if possible
+            if ($r_value === null && $thickness_m !== null && $lambda_w_mk !== null && $lambda_w_mk > 0) {
+                $r_value = $thickness_m / $lambda_w_mk;
+            }
+            // Compute missing U from R
+            if ($u_value === null && $r_value !== null && $r_value > 0) {
+                $u_value = 1.0 / $r_value;
+            }
+
+            // Ignore header/empty rows (require at least a material or role)
             if ($role === null && $material === null) continue;
 
             $insert[] = [
@@ -250,8 +280,15 @@ class ImportEnvironmentalLayersFromExcel extends Command
                 'mass_kg_m2'         => $mass_m2,
 
                 'carbon_factor'      => $cf,
+                'carbon_factor_unit' => $cf_unit,
                 'a1a3_per_5_76_m2'   => $a1a3_576,
                 'a1a3_per_m2'        => $a1a3_m2,
+
+                'thermal_conductivity_w_mk' => $lambda_w_mk,
+                'r_value_m2k_w'             => $r_value,
+                'u_value_w_m2k'             => $u_value,
+
+                'life_expectancy_years'     => $life_years,
 
                 'created_at'         => now(),
                 'updated_at'         => now(),
@@ -403,11 +440,11 @@ class ImportEnvironmentalLayersFromExcel extends Command
         if (!$mmcMethod) return null;
         $s = strtolower($mmcMethod);
         return match (true) {
-            str_contains($s, 'block')                => 'BLOCK',
+            str_contains($s, 'block')                                  => 'BLOCK',
             str_contains($s, 'lgs') || str_contains($s, 'light gauge') => 'LGS',
-            str_contains($s, 'timber')               => 'TIMBER',
-            str_contains($s, 'icf')                  => 'ICF',
-            default                                  => strtoupper(Str::slug($mmcMethod, '_')),
+            str_contains($s, 'timber')                                 => 'TIMBER',
+            str_contains($s, 'icf')                                    => 'ICF',
+            default                                                    => strtoupper(Str::slug($mmcMethod, '_')),
         };
     }
 

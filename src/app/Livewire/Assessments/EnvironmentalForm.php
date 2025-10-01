@@ -4,7 +4,7 @@ namespace App\Livewire\Assessments;
 
 use App\Models\Assessment;
 use App\Models\DatasetVersion;
-use App\Services\EnvironmentalCalculator;
+use App\Services\Assessments\EnvironmentalCalculator;
 use Illuminate\Support\Facades\DB;
 use Livewire\Attributes\Layout;
 use Livewire\Component;

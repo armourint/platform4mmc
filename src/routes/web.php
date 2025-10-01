@@ -39,6 +39,7 @@ use App\Livewire\Assessments\Index as AssessmentsIndex;
 use App\Livewire\Assessments\ViabilityWizard;
 use App\Livewire\Assessments\EnvironmentalForm;
 use App\Livewire\Assessments\Results;
+use App\Livewire\Environmental\SystemBrowser;
 
 Route::middleware(['auth'])->group(function () {
     // Optional alias for Breeze “Dashboard”
@@ -58,6 +59,9 @@ Route::middleware(['auth'])->group(function () {
 
     // Index page for nav
     Route::get('/assessments', AssessmentsIndex::class)->name('assessments.index');
+
+    // Environmental System Browser (comparison UI)
+    Route::get('/environmental/browser', SystemBrowser::class)->name('environmental.browser');
 });
 
 /*
@@ -105,13 +109,11 @@ Route::middleware(['auth', 'admin'])
         Route::get('/knowledge/ping', fn () => 'admin-knowledge-ok')->name('knowledge.ping');
 
         Route::prefix('knowledge')->name('knowledge.')->group(function () {
-            
-            
             // Landing alias → Articles index
             Route::get('/', function () {
                 return redirect()->route('admin.knowledge.articles.index');
             })->name('index');
-            
+
             // Articles
             Route::prefix('articles')->name('articles.')->group(function () {
                 Route::get('/', AdminArticleList::class)->name('index');                // /admin/knowledge/articles
@@ -123,9 +125,9 @@ Route::middleware(['auth', 'admin'])
 
             // Categories
             Route::prefix('categories')->name('categories.')->group(function () {
-                Route::get('/', AdminCategoryList::class)->name('index');                // /admin/knowledge/categories
-                Route::get('/create', AdminCreateCategory::class)->name('create');       // /admin/knowledge/categories/create
-                Route::get('/{category:id}/edit', AdminEditCategory::class)              // /admin/knowledge/categories/123/edit
+                Route::get('/', AdminCategoryList::class)->name('index');               // /admin/knowledge/categories
+                Route::get('/create', AdminCreateCategory::class)->name('create');      // /admin/knowledge/categories/create
+                Route::get('/{category:id}/edit', AdminEditCategory::class)             // /admin/knowledge/categories/123/edit
                     ->whereNumber('category')
                     ->name('edit');
             });
