@@ -4,6 +4,11 @@ namespace App\Console\Commands;
 
 use App\Models\DataImport;
 use App\Models\DatasetVersion;
+use App\Models\EnvironmentalFactor;
+use App\Models\EnvironmentalLayer;
+use App\Models\EnvironmentalProperty;
+use App\Models\EnvironmentalSnapshot;
+use App\Models\EnvironmentalSystem;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -17,17 +22,19 @@ class ImportEnvironmentalLayersFromExcel extends Command
         {--dataset-version= : DatasetVersion ID or label to attach to}
         {--dataset-version-id= : Reuse this dataset_versions.id (never create another)}
         {--reset : Truncate existing rows for this dataset_version before import}
-        {--sheet : Sheet name (default: na)}';
+        {--sheet= : Force a specific sheet name (debug)}
+        {--a4-factor=0.06 : Default A4 factor in kgCO2e per kg of transported mass}
+        {--u-default=0.18 : Default U-value (W/m²K) when not present}
+        {--snapshot : Build per-system snapshots after import}';
 
-    protected $description = 'Import Environmental layers from the MMC workbook into environmental_layers (no schema changes)';
+    protected $description = 'Import Environmental layers (A1–A3) from MMC workbook; upsert systems, seed U & A4, and optionally snapshot.';
 
-    // ------------ Sheet names ------------
-    protected array $SHEETS_WALLS     = ['Wall Systems', 'Walls', 'A1-A3 Walls'];
-    protected array $SHEETS_CLADDING  = ['Cladding Systems', 'Cladding', 'A1-A3 Cladding'];
-    protected array $SHEETS_SLABS     = ['Slab Systems', 'Slabs', 'A1-A3 Slabs'];
-    protected array $SHEET_A4_WALLS   = ['Wall Systems (A4)', 'Walls (A4)', 'A4 Walls', 'A4'];
+    // Candidate sheet names per category (order = priority)
+    protected array $SHEETS_WALLS    = ['Wall Systems', 'Walls', 'A1-A3 Walls', 'Walls (A1-A3)'];
+    protected array $SHEETS_CLADDING = ['Cladding Systems', 'Cladding', 'A1-A3 Cladding', 'Cladding (A1-A3)'];
+    protected array $SHEETS_SLABS    = ['Slab Systems', 'Slabs', 'A1-A3 Slabs', 'Slabs (A1-A3)'];
 
-    // ------------ Column alias map (left = logical name we use in code) ------------
+    // Column alias map (left = logical field, right = array of fuzzy matches)
     protected array $ALIASES = [
         // System meta
         'system_code'      => ['System Code','SystemCode','Code','MMC Code'],
@@ -37,7 +44,7 @@ class ImportEnvironmentalLayersFromExcel extends Command
         'system_category'  => ['System Category','SystemCategory','System Type','SystemType'],
 
         // Layer fields
-        'layer_no'         => ['Layer No.','LayerNo','Layer Number','Layer #'],
+        'layer_no'         => ['Layer No.','LayerNo','Layer Number','Layer #','Layer'],
         'functional_role'  => ['Functional Role','Role','Function'],
         'generic_material' => ['Generic Material','Material','Generic Material Name'],
 
@@ -52,59 +59,51 @@ class ImportEnvironmentalLayersFromExcel extends Command
         'total_volume_m3'  => ['Total Volume (m3)','Total_Volume_m3','Total Vol (m3)'],
 
         // Physical props
-        'density_kg_m3'    => ['Density (kg/m3)','Density_kg_m3','Density kg/m3'],
-        'mass_kg_m2'       => ['Mass (kg/m²)','Mass kg/m2','Mass kg/m^2','Mass (kg/m2)'],
+        'density_kg_m3'    => ['Density (kg/m3)','Density_kg_m3','Density kg/m3','Density (kg/m³)'],
+        'mass_kg_m2'       => ['Mass (kg/m²)','Mass kg/m2','Mass kg/m^2','Mass (kg/m2)','Mass (kg/m^2)'],
 
         // Carbon
-        'carbon_factor'    => ['Carbon Factor (kgCO2e/kg)','Carbon Factor','Carbon factor (kgCO2e/kg)'],
-        'carbon_factor_unit'=> ['Carbon Factor Unit','CF Unit','CF Units','Carbon Factor (unit)'],
-        'a1a3_per_m2'      => ['A1–A3 (kg CO2e / m²)','A1-A3 (kgCO2e/m2)','A1A3_kgCO2e_per_m2'],
+        'carbon_factor'    => ['Carbon Factor (kgCO2e/kg)','Carbon Factor','Carbon factor (kgCO2e/kg)','CF (kgCO2e/kg)'],
+        'a1a3_per_m2'      => ['A1–A3 (kg CO2e / m²)','A1-A3 (kgCO2e/m2)','A1A3_kgCO2e_per_m2','A1-A3 kgCO2e/m²'],
         'a1a3_per_5_76_m2' => ['A1–A3 (kg CO2e / 5.76 m²)','A1-A3 (kgCO2e / 5.76 m2)','A1A3_kgCO2e_per_5_76m2'],
-
-        // Thermal (per-layer)
-        'thermal_conductivity_w_mk' => [
-            'Thermal Conductivity (W/mK)','Thermal Conductivity (W/m·K)','Lambda (W/mK)','λ (W/mK)','k (W/mK)'
-        ],
-        'r_value_m2k_w'    => ['R-Value (m2K/W)','R Value (m²K/W)','R-Value','R (m2K/W)'],
-        'u_value_w_m2k'    => ['U-Value (W/m2K)','U Value (W/m²·K)','U-value','U (W/m2K)'],
-
-        // Durability
-        'life_expectancy_years' => ['Life Expectancy (years)','Service Life (years)','Life (years)','Life span (years)'],
-
-        // A4 (handled separately if you later map to environmental_factors)
-        'a4_per_m2'        => ['A4 (kgCO2e/m2)','A4 (kgCO₂e/m²)','A4_kgCO2e_per_m2'],
     ];
 
     public function handle(): int
     {
         try {
-            // 1) Resolve import source and dataset_version_id
             [$path, $datasetVersionId, $sourceFrom] = $this->resolveSourceAndDatasetVersion();
             $this->line("Source: {$sourceFrom}");
             $this->info("Using dataset_version_id = {$datasetVersionId}");
             $this->line("Workbook: {$path}");
 
-            // 2) Load workbook (read-only)
             $reader = IOFactory::createReaderForFile($path);
             $reader->setReadDataOnly(true);
             $wb = $reader->load($path);
 
-            // 3) Reset (optional)
             if ($this->option('reset')) {
-                DB::table('environmental_layers')->where('dataset_version_id', $datasetVersionId)->delete();
-                $this->warn("Reset: deleted existing environmental_layers for dataset_version_id={$datasetVersionId}");
+                DB::transaction(function () use ($datasetVersionId) {
+                    DB::table('environmental_layers')->where('dataset_version_id', $datasetVersionId)->delete();
+                    DB::table('environmental_systems')->where('dataset_version_id', $datasetVersionId)->delete();
+                    DB::table('environmental_factors')->where('dataset_version_id', $datasetVersionId)->delete();
+                    DB::table('environmental_snapshots')->where('dataset_version_id', $datasetVersionId)->delete();
+                });
+                $this->warn("Reset: deleted existing rows for dataset_version_id={$datasetVersionId}");
             }
 
-            // 4) Import main A1–A3 sheets (walls, cladding, slabs)
+            $forced = $this->option('sheet');
             $total = 0;
-            $total += $this->importCategory($wb, $datasetVersionId, $this->SHEETS_WALLS,    'Wall',     'A1-A3 Walls');
-            $total += $this->importCategory($wb, $datasetVersionId, $this->SHEETS_CLADDING, 'Cladding', 'A1-A3 Cladding');
-            $total += $this->importCategory($wb, $datasetVersionId, $this->SHEETS_SLABS,    'Slab',     'A1-A3 Slabs');
 
-            $this->info("Imported {$total} layer rows.");
+            if ($forced) {
+                $total += $this->importCategory($wb, $datasetVersionId, [$forced], 'Unknown', $forced);
+            } else {
+                $total += $this->importCategory($wb, $datasetVersionId, $this->SHEETS_WALLS, 'Wall', 'A1-A3 Walls');
+                $total += $this->importCategory($wb, $datasetVersionId, $this->SHEETS_CLADDING, 'Cladding', 'A1-A3 Cladding');
+                $total += $this->importCategory($wb, $datasetVersionId, $this->SHEETS_SLABS, 'Slab', 'A1-A3 Slabs');
+            }
 
-            // (Optional A4 factors can be added later.)
+            $this->info("Imported {$total} environmental layer rows.");
             return self::SUCCESS;
+
         } catch (\Throwable $e) {
             $this->error("Import failed: {$e->getMessage()}");
             if ($this->getOutput()->isVerbose()) {
@@ -114,8 +113,9 @@ class ImportEnvironmentalLayersFromExcel extends Command
         }
     }
 
-    // ---------------------------- Core import per category ----------------------------
-
+    // ---------------------------------------------------------------------
+    // Core import per category
+    // ---------------------------------------------------------------------
     protected function importCategory(\PhpOffice\PhpSpreadsheet\Spreadsheet $wb, int $datasetVersionId, array $sheetCandidates, string $systemCategory, string $sourceHeader): int
     {
         $sheetName = $this->pickSheet($wb, $sheetCandidates);
@@ -124,11 +124,11 @@ class ImportEnvironmentalLayersFromExcel extends Command
             return 0;
         }
 
-        $ws = $wb->getSheetByName($sheetName);
+        $ws   = $wb->getSheetByName($sheetName);
         $rows = $ws->toArray(null, true, true, true);
         if (!$rows) return 0;
 
-        // Find header row (first non-empty row)
+        // Find header
         $headerRow = null; $start = 0;
         foreach ($rows as $i => $r) {
             if (array_filter($r, fn($v) => $v !== null && $v !== '')) {
@@ -140,14 +140,12 @@ class ImportEnvironmentalLayersFromExcel extends Command
         if (!$headerRow) return 0;
 
         $hdr = $headerRow;
-
-        // Helper to find source column by alias
         $col = function(string $logical) use ($hdr) {
             $targets = $this->ALIASES[$logical] ?? [$logical];
             return $this->findHeader($hdr, $targets);
         };
 
-        // Resolve columns once
+        // Resolve column indices once
         $c_system_code      = $col('system_code');
         $c_mmc_method       = $col('mmc_method');
         $c_assembly_id      = $col('assembly_id');
@@ -170,37 +168,31 @@ class ImportEnvironmentalLayersFromExcel extends Command
         $c_mass_m2          = $col('mass_kg_m2');
 
         $c_cf               = $col('carbon_factor');
-        $c_cf_unit          = $col('carbon_factor_unit');
         $c_a1a3_m2          = $col('a1a3_per_m2');
         $c_a1a3_576         = $col('a1a3_per_5_76_m2');
 
-        // NEW thermal/durability columns
-        $c_lambda           = $col('thermal_conductivity_w_mk');
-        $c_rvalue           = $col('r_value_m2k_w');
-        $c_uvalue           = $col('u_value_w_m2k');
-        $c_life             = $col('life_expectancy_years');
+        $insert  = [];
+        $count   = 0;
 
-        $insert = [];
+        // Per-system caches
+        $systemsTouched = []; // [code] => meta
+        $agg = [];            // [code] => mass_total, a1a3_total, layers[]
+
+        // Row loop
         for ($i = $start; $i <= count($rows); $i++) {
             $r = $rows[$i] ?? null; if (!$r) continue;
             $vals = array_values($r);
             if (!array_filter($vals, fn($v) => $v !== null && $v !== '')) continue;
 
-            $get = function($idx) use ($vals) {
-                return $idx === null ? null : ($vals[$idx] ?? null);
-            };
+            $get = function($idx) use ($vals) { return $idx === null ? null : ($vals[$idx] ?? null); };
 
-            // Read raw values
+            // System meta
             $system_code  = $this->cleanStr($get($c_system_code));
             $mmc_method   = $this->cleanStr($get($c_mmc_method));
             $assembly_id  = $this->cleanStr($get($c_assembly_id)) ?: null;
             $system_name  = $this->cleanStr($get($c_system_name)) ?: null;
-
-            // Prefer given sheet category label, fallback to column if present
             $sys_cat      = $systemCategory ?: $this->cleanStr($get($c_system_category));
             $sys_cat      = $this->normalizeCategory($sys_cat);
-
-            // If system_code missing, try deriving from mmc_method
             if (!$system_code) $system_code = $this->deriveSystemCode($mmc_method);
 
             // Layer fields
@@ -208,7 +200,7 @@ class ImportEnvironmentalLayersFromExcel extends Command
             $role         = $this->cleanStr($get($c_role));
             $material     = $this->cleanStr($get($c_mat));
 
-            // Dimensions / quantities
+            // Dimensions
             $length_m     = $this->toFloat($get($c_len));
             $height_m     = $this->toFloat($get($c_hgt));
 
@@ -228,33 +220,17 @@ class ImportEnvironmentalLayersFromExcel extends Command
 
             // Carbon
             $cf           = $this->toFloat($get($c_cf));
-            $cf_unit      = $this->cleanStr($get($c_cf_unit));
             $a1a3_m2      = $this->toFloat($get($c_a1a3_m2));
             $a1a3_576     = $this->toFloat($get($c_a1a3_576));
 
-            // If A1-A3 not given but mass & CF available, compute
             if ($a1a3_m2 === null && $mass_m2 !== null && $cf !== null) {
                 $a1a3_m2 = $mass_m2 * $cf;
             }
 
-            // Thermal / durability
-            $lambda_w_mk  = $this->toFloat($get($c_lambda)); // thermal conductivity
-            $r_value      = $this->toFloat($get($c_rvalue));
-            $u_value      = $this->toFloat($get($c_uvalue));
-            $life_years   = $this->toFloat($get($c_life));
-
-            // Compute missing R from thickness / lambda if possible
-            if ($r_value === null && $thickness_m !== null && $lambda_w_mk !== null && $lambda_w_mk > 0) {
-                $r_value = $thickness_m / $lambda_w_mk;
-            }
-            // Compute missing U from R
-            if ($u_value === null && $r_value !== null && $r_value > 0) {
-                $u_value = 1.0 / $r_value;
-            }
-
-            // Ignore header/empty rows (require at least a material or role)
+            // Ignore empty rows
             if ($role === null && $material === null) continue;
 
+            // Prepare layer insert
             $insert[] = [
                 'dataset_version_id' => $datasetVersionId,
                 'system_code'        => $system_code ?: 'UNKNOWN',
@@ -271,7 +247,6 @@ class ImportEnvironmentalLayersFromExcel extends Command
                 'length_m'           => $length_m,
                 'height_m'           => $height_m,
                 'thickness_m'        => $thickness_m,
-
                 'element_volume_m3'  => $elem_vol,
                 'element_number'     => $elem_num,
                 'total_volume_m3'    => $tot_vol,
@@ -280,23 +255,48 @@ class ImportEnvironmentalLayersFromExcel extends Command
                 'mass_kg_m2'         => $mass_m2,
 
                 'carbon_factor'      => $cf,
-                'carbon_factor_unit' => $cf_unit,
                 'a1a3_per_5_76_m2'   => $a1a3_576,
                 'a1a3_per_m2'        => $a1a3_m2,
-
-                'thermal_conductivity_w_mk' => $lambda_w_mk,
-                'r_value_m2k_w'             => $r_value,
-                'u_value_w_m2k'             => $u_value,
-
-                'life_expectancy_years'     => $life_years,
 
                 'created_at'         => now(),
                 'updated_at'         => now(),
             ];
+
+            // Catalog (once per system per dataset)
+            if (!isset($systemsTouched[$system_code])) {
+                $systemsTouched[$system_code] = [
+                    'dataset_version_id' => $datasetVersionId,
+                    'system_code'        => $system_code,
+                    'assembly_id'        => $assembly_id,
+                    'system_name'        => $system_name ?: $system_code,
+                    'system_category'    => $sys_cat,
+                    'mmc_method'         => $mmc_method,
+                    'is_active'          => true,
+                    'slug'               => Str::slug($system_name ?: $system_code),
+                ];
+            }
+
+            // Aggregates for snapshots & A4
+            if (!isset($agg[$system_code])) {
+                $agg[$system_code] = [
+                    'mass_total' => 0.0,
+                    'a1a3_total' => 0.0,
+                    'layers'     => [],
+                ];
+            }
+            $agg[$system_code]['mass_total'] += (float) ($mass_m2 ?? 0);
+            $agg[$system_code]['a1a3_total'] += (float) ($a1a3_m2 ?? 0);
+            $agg[$system_code]['layers'][] = [
+                'layer_no'         => $layer_no,
+                'functional_role'  => $role,
+                'generic_material' => $material,
+                'mass_kg_m2'       => $mass_m2,
+                'a1a3_per_m2'      => $a1a3_m2,
+                'carbon_factor'    => $cf,
+            ];
         }
 
-        // Bulk insert in chunks
-        $count = 0;
+        // Bulk insert layers
         DB::transaction(function () use (&$count, $insert) {
             foreach (array_chunk($insert, 1000) as $chunk) {
                 DB::table('environmental_layers')->insert($chunk);
@@ -304,15 +304,99 @@ class ImportEnvironmentalLayersFromExcel extends Command
             }
         });
 
-        $this->info("  - {$systemCategory}: inserted {$count} rows from sheet '{$sheetName}'");
+        // Upsert system catalog
+        foreach ($systemsTouched as $code => $data) {
+            EnvironmentalSystem::updateOrCreate(
+                ['dataset_version_id' => $datasetVersionId, 'system_code' => $code],
+                $data
+            );
+        }
+
+        // Properties (U only for MVP / default)
+        $uDefault = (float) $this->option('u-default') ?: 0.18;
+        foreach (array_keys($systemsTouched) as $code) {
+            $sys = EnvironmentalSystem::where([
+                'dataset_version_id' => $datasetVersionId,
+                'system_code'        => $code,
+            ])->first();
+
+            if ($sys && !$sys->properties) {
+                EnvironmentalProperty::create([
+                    'environmental_system_id' => $sys->id,
+                    'u_value_w_m2k'           => $uDefault,
+                ]);
+            }
+        }
+
+        // A4 factors (formulaic)
+        $a4PerKg = max(0.0, (float) $this->option('a4-factor'));
+        foreach ($agg as $code => $a) {
+            $a4 = $a4PerKg > 0 ? ($a['mass_total'] * $a4PerKg) : 0.0;
+            EnvironmentalFactor::updateOrCreate(
+                ['dataset_version_id' => $datasetVersionId, 'system_code' => $code],
+                [
+                    'a4_kgco2e_m2'    => round($a4, 6),
+                    // leave a5/c1-c4 null for MVP
+                    'source'          => 'importer-default',
+                    'meta_json'       => null,
+                ]
+            );
+        }
+
+        // Snapshots (optional)
+        if ($this->option('snapshot')) {
+            foreach ($agg as $code => $a) {
+                $layers = collect($a['layers'])->sortBy('layer_no')->values()->all();
+                $hotspots = collect($layers)
+                    ->map(fn($r) => [
+                        'label' => $r['generic_material'] ?: ($r['functional_role'] ?: ('Layer '.$r['layer_no'])),
+                        'a1a3'  => (float) ($r['a1a3_per_m2'] ?? 0),
+                    ])
+                    ->sortByDesc('a1a3')->take(5)->values()->all();
+
+                $a4 = (float) (EnvironmentalFactor::where([
+                    'dataset_version_id' => $datasetVersionId,
+                    'system_code'        => $code,
+                ])->value('a4_kgco2e_m2') ?? 0);
+
+                $kpi = [
+                    'layer_count'              => count($layers),
+                    'mass_total_kg_m2'         => round((float)$a['mass_total'], 6),
+                    'a1a3_total_kgco2e_m2'     => round((float)$a['a1a3_total'], 6),
+                    'a4_total_kgco2e_m2'       => round($a4, 6),
+                    'overall_total_kgco2e_m2'  => round((float)$a['a1a3_total'] + $a4, 6),
+                ];
+
+                $chart = collect($layers)->map(fn($r) => [
+                    'x'          => (int) $r['layer_no'],
+                    'mass_kg_m2' => (float) ($r['mass_kg_m2'] ?? 0),
+                ])->values()->all();
+
+                $checksum = md5(json_encode([$kpi, $layers]));
+
+                EnvironmentalSnapshot::updateOrCreate(
+                    ['dataset_version_id' => $datasetVersionId, 'system_code' => $code],
+                    [
+                        'kpi_json'        => $kpi,
+                        'layers_json'     => $layers,
+                        'hotspots_json'   => $hotspots,
+                        'chart_rows_json' => $chart,
+                        'checksum'        => $checksum,
+                    ]
+                );
+            }
+        }
+
+        $this->info("  - {$systemCategory}: inserted {$count} rows from '{$sheetName}'");
         return $count;
     }
 
-    // ---------------------------- Helpers ----------------------------
-
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
     protected function resolveSourceAndDatasetVersion(): array
     {
-        // If an Admin Import queued this, prefer DataImport info
+        // Prefer DataImport row
         if ($id = $this->option('import-id')) {
             /** @var DataImport $imp */
             $imp = DataImport::query()->findOrFail($id);
@@ -320,14 +404,12 @@ class ImportEnvironmentalLayersFromExcel extends Command
             $disk = $imp->disk ?: 'public';
             $path = \Storage::disk($disk)->path($imp->path);
 
-            // DatasetVersion: use the one already associated, else create one from label in meta if present
             $datasetVersionId = $imp->dataset_version_id
                 ?: $this->findOrCreateDatasetVersionId(
                     module: 'environmental',
                     label: data_get($imp->meta, 'dataset_label') ?: (string)$imp->id
                 );
 
-            // Backfill onto the DataImport row for consistency
             if (!$imp->dataset_version_id) {
                 $imp->dataset_version_id = $datasetVersionId;
                 $imp->save();
@@ -339,24 +421,19 @@ class ImportEnvironmentalLayersFromExcel extends Command
         // Manual path
         $path = (string) $this->option('path');
         if (!$path || !is_file($path)) {
-            throw new \RuntimeException('--path is required (absolute path to workbook) or use --import-id=');
+            throw new \RuntimeException('--path is required (absolute file path) or use --import-id=');
         }
 
-        // DatasetVersion selection
+        // DatasetVersion by explicit id
         if ($this->option('dataset-version-id')) {
             $id = (int) $this->option('dataset-version-id');
             $exists = DatasetVersion::query()->whereKey($id)->exists();
             if (!$exists) throw new \RuntimeException("dataset_version_id={$id} not found.");
-            return [$path, $id, 'manual path'];
+            return [$path, $id, 'manual path (id)'];
         }
 
-        $labelOrId = (string) $this->option('dataset-version');
-        if (!$labelOrId) {
-            // Sensible default label: timestamp
-            $labelOrId = now()->format('Ymd_His');
-        }
-
-        // If numeric and exists as ID, use it; else find/create by label under module='environmental'
+        // DatasetVersion by label or create
+        $labelOrId = (string) ($this->option('dataset-version') ?: now()->format('Ymd_His'));
         $datasetVersionId = $this->resolveDatasetVersionId('environmental', $labelOrId);
 
         return [$path, $datasetVersionId, 'manual path'];
@@ -369,7 +446,6 @@ class ImportEnvironmentalLayersFromExcel extends Command
             $exists = DatasetVersion::query()->whereKey($id)->exists();
             if ($exists) return $id;
         }
-
         return $this->findOrCreateDatasetVersionId($module, $labelOrId);
     }
 
@@ -385,7 +461,7 @@ class ImportEnvironmentalLayersFromExcel extends Command
         $dv = DatasetVersion::create([
             'module'        => $module,
             'version_label' => $label,
-            'status'        => 'draft',   // do not auto-publish
+            'status'        => 'draft',
             'is_current'    => false,
         ]);
 
@@ -395,7 +471,6 @@ class ImportEnvironmentalLayersFromExcel extends Command
     protected function pickSheet(\PhpOffice\PhpSpreadsheet\Spreadsheet $wb, array $candidates): ?string
     {
         $names = $wb->getSheetNames();
-        // Search by case-insensitive contains
         foreach ($candidates as $cand) {
             foreach ($names as $n) {
                 if (Str::of($n)->lower()->contains(Str::of($cand)->lower())) {
@@ -403,7 +478,6 @@ class ImportEnvironmentalLayersFromExcel extends Command
                 }
             }
         }
-        // Exact match fallback
         foreach ($candidates as $cand) {
             if (in_array($cand, $names, true)) return $cand;
         }
@@ -412,14 +486,13 @@ class ImportEnvironmentalLayersFromExcel extends Command
 
     protected function findHeader(array $headerRow, array $aliases): ?int
     {
-        // return index in $headerRow for the first alias that appears (fuzzy contains)
         $norm = fn($s) => strtolower(preg_replace('/\s+/', '', (string)$s));
         $targets = array_map($norm, $aliases);
 
         foreach ($headerRow as $idx => $label) {
             $h = $norm($label);
             foreach ($targets as $t) {
-                if ($t !== '' && Str::contains($h, $t)) return $idx;
+                if ($t !== '' && str_contains($h, $t)) return $idx;
             }
         }
         return null;
@@ -444,7 +517,7 @@ class ImportEnvironmentalLayersFromExcel extends Command
             str_contains($s, 'lgs') || str_contains($s, 'light gauge') => 'LGS',
             str_contains($s, 'timber')                                 => 'TIMBER',
             str_contains($s, 'icf')                                    => 'ICF',
-            default                                                    => strtoupper(Str::slug($mmcMethod, '_')),
+            default                                                     => strtoupper(Str::slug($mmcMethod, '_')),
         };
     }
 

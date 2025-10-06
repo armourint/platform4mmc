@@ -35,6 +35,15 @@ class EnvironmentalForm extends Component
     // Cache the DV id we’re working with
     public ?int $datasetVersionId = null;
 
+    /** Injected services */
+    protected EnvironmentalCalculator $calculator;
+
+    /** Bind the calculator from the container each request */
+    public function boot(EnvironmentalCalculator $calculator): void
+    {
+        $this->calculator = $calculator;
+    }
+
     /** Accepts either a Project model (route-model bound) or id */
     public function mount($project = null): void
     {
@@ -116,6 +125,7 @@ class EnvironmentalForm extends Component
     {
         $this->validate();
 
+        // Resolve dataset version
         $dv = $this->datasetVersionId
             ? DatasetVersion::find($this->datasetVersionId)
             : DatasetVersion::where('module','environmental')->where('status','published')->latest('id')->first();
@@ -124,6 +134,9 @@ class EnvironmentalForm extends Component
             $this->notice = 'No published Environmental dataset found. Please import & publish one.';
             return;
         }
+
+        // Keep local cache in sync
+        $this->datasetVersionId = (int) $dv->id;
 
         $inputs = [
             'a1_a3' => $this->a1_a3 ?? 0.0,
@@ -158,9 +171,10 @@ class EnvironmentalForm extends Component
 
         // Optional layer snapshot from published dataset
         if ($this->selected_system_code) {
-            /** @var EnvironmentalCalculator $calc */
-            $calc = app(EnvironmentalCalculator::class);
-            $snapshot = $calc->snapshotForSystem($dv, $this->selected_system_code);
+            $snapshot = $this->calculator->snapshotForSystem(
+                (int) $dv->id,                                    // <-- pass the ID
+                (string) $this->selected_system_code
+            );
             $outputs['layer_snapshot'] = $snapshot;
         }
 

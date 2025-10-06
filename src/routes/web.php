@@ -40,6 +40,7 @@ use App\Livewire\Assessments\ViabilityWizard;
 use App\Livewire\Assessments\EnvironmentalForm;
 use App\Livewire\Assessments\Results;
 use App\Livewire\Environmental\SystemBrowser;
+use App\Livewire\Environmental\SystemCompare;
 
 Route::middleware(['auth'])->group(function () {
     // Optional alias for Breeze “Dashboard”
@@ -61,7 +62,8 @@ Route::middleware(['auth'])->group(function () {
     Route::get('/assessments', AssessmentsIndex::class)->name('assessments.index');
 
     // Environmental System Browser (comparison UI)
-    Route::get('/environmental/browser', SystemBrowser::class)->name('environmental.browser');
+    //Route::get('/environmental/browser', SystemBrowser::class)->name('environmental.browser');
+    Route::get('/environmental/browser', SystemCompare::class)->name('environmental.browser');
 });
 
 /*
