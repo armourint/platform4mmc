@@ -6,6 +6,7 @@ use App\Models\DatasetVersion;
 use App\Models\EnvironmentalLayer;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
+use App\Models\EnvironmentalSnapshot;
 
 class EnvironmentalCalculator
 {
@@ -83,7 +84,80 @@ class EnvironmentalCalculator
      */
     public function snapshotForSystem(int $datasetVersionId, string $systemCode): array
     {
-        $layers = EnvironmentalLayer::query()
+        // 1) Try to use a precomputed snapshot first (fast path)
+        /** @var \App\Models\EnvironmentalSnapshot|null $snap */
+        $snap = \App\Models\EnvironmentalSnapshot::query()
+            ->where('dataset_version_id', $datasetVersionId)
+            ->where('system_code', $systemCode)
+            // If multiple snapshots exist (e.g., multiple assemblies), prefer the latest
+            // You can change this to a more specific pick once assembly_id is threaded through the UI
+            ->orderByDesc('id')
+            ->first();
+
+        if ($snap) {
+            $kpi      = (array) ($snap->kpi_json ?? []);
+            $layersJs = (array) ($snap->layers_json ?? []);
+            $hotsJs   = (array) ($snap->hotspots_json ?? []);
+            $chartJs  = (array) ($snap->chart_rows_json ?? []);
+
+            // Normalise totals
+            $a1a3Total = (float) ($kpi['a1_a3_per_m2'] ?? 0.0);
+            $a4Total   = (float) ($kpi['a4_per_m2']   ?? 0.0);
+            $massTotal = (float) array_sum(array_map(fn($r) => (float)($r['mass_kg_m2'] ?? 0), $layersJs));
+            $cfAvg     = $massTotal > 0 ? $a1a3Total / $massTotal : 0.0;
+
+            // Map layers to your UI shape
+            $prettyLayers = array_map(function ($r) {
+                return [
+                    'layer_no'         => (int)   ($r['layer_no']         ?? 0),
+                    'functional_role'  => (string)($r['functional_role']  ?? ''),
+                    'generic_material' => (string)($r['generic_material'] ?? ''),
+                    'mass_kg_m2'       => (float) ($r['mass_kg_m2']       ?? 0),
+                    'carbon_factor'    => (float) ($r['carbon_factor']    ?? 0),
+                    'thermal_conductivity_w_mk' => null,
+                    'r_value_m2k_w'             => null,
+                    'u_value_w_m2k'             => null, // per-layer U is not used; system U is in KPI
+                    'a1a3_per_m2'      => (float) ($r['a1a3_per_m2']      ?? 0),
+                    'carbon_factor_unit'=> 'kgCO₂e/kg',
+                ];
+            }, $layersJs);
+
+            // Map hotspots to your UI shape (label + a1a3)
+            $hotspots = array_map(function ($r) {
+                // snapshots may store 'a1a3_per_m2' or 'a1a3'
+                $val = $r['a1a3_per_m2'] ?? $r['a1a3'] ?? 0.0;
+                return [
+                    'label' => (string)($r['label'] ?? ''),
+                    'a1a3'  => (float)$val,
+                ];
+            }, $hotsJs);
+
+            // Mass series for chart (if you still use it)
+            $massSeries = [
+                'labels' => array_map(fn($r) => (string)($r['layer_no'] ?? ''), $layersJs),
+                'values' => array_map(fn($r) => (float) ($r['mass_kg_m2'] ?? 0), $layersJs),
+            ];
+
+            return [
+                'system_code' => (string)($kpi['system_code'] ?? $systemCode),
+                'system_name' => (string)($kpi['system_name'] ?? $systemCode),
+                'kpi' => [
+                    'layer_count'              => (int)   count($layersJs),
+                    'mass_total_kg_m2'         => (float) $massTotal,
+                    'a1a3_total_kgco2e_m2'     => (float) $a1a3Total,
+                    'overall_total_kgco2e_m2'  => (float) ($a1a3Total + $a4Total),
+                    'cf_avg_kgco2e_per_kg'     => (float) $cfAvg,
+                    // You can also surface U here if your UI needs it:
+                    // 'u_value_w_m2k' => $kpi['u_value_w_m2k'] ?? null,
+                ],
+                'layers'     => $prettyLayers,
+                'hotspots'   => $hotspots,
+                'massSeries' => $massSeries,
+            ];
+        }
+
+        // 2) Fallback: compute from layers live (slower, but robust)
+        $layers = \App\Models\EnvironmentalLayer::query()
             ->where('dataset_version_id', $datasetVersionId)
             ->where('system_code', $systemCode)
             ->orderBy('layer_no')
@@ -106,21 +180,36 @@ class EnvironmentalCalculator
             ];
         }
 
+        // Derive missing a1a3_per_m2 if mass & CF exist
+        $layers = $layers->map(function ($r) {
+            if (is_null($r->a1a3_per_m2) && $r->mass_kg_m2 && $r->carbon_factor) {
+                $r->a1a3_per_m2 = (float)$r->mass_kg_m2 * (float)$r->carbon_factor;
+            }
+            return $r;
+        });
+
         $massTotal = (float) round($layers->sum('mass_kg_m2'), 6);
         $a1a3Total = (float) round($layers->sum('a1a3_per_m2'), 6);
         $cfAvg     = $massTotal > 0 ? $a1a3Total / $massTotal : 0.0;
 
-        $prettyLayers = $layers->map(function (EnvironmentalLayer $r) {
+        // A4 from factors (per system_code); fallback to constant * mass
+        $factor = \App\Models\EnvironmentalFactor::query()
+            ->where('dataset_version_id', $datasetVersionId)
+            ->where('system_code', $systemCode)
+            ->first();
+        $a4Total = (float) ($factor?->a4_per_m2 ?? 0.0);
+
+        $prettyLayers = $layers->map(function ($r) {
             return [
-                'layer_no'         => $r->layer_no,
-                'functional_role'  => $r->functional_role,
-                'generic_material' => $r->generic_material,
-                'mass_kg_m2'       => $r->mass_kg_m2,
-                'carbon_factor'    => $r->carbon_factor,
-                'thermal_conductivity_w_mk' => null, // fill when you have λ
-                'r_value_m2k_w'             => null, // fill when you have R
-                'u_value_w_m2k'             => null, // fill when you have U
-                'a1a3_per_m2'      => $r->a1a3_per_m2,
+                'layer_no'         => (int)   $r->layer_no,
+                'functional_role'  => (string)$r->functional_role,
+                'generic_material' => (string)$r->generic_material,
+                'mass_kg_m2'       => (float) $r->mass_kg_m2,
+                'carbon_factor'    => (float) $r->carbon_factor,
+                'thermal_conductivity_w_mk' => null,
+                'r_value_m2k_w'             => null,
+                'u_value_w_m2k'             => null,
+                'a1a3_per_m2'      => (float) $r->a1a3_per_m2,
                 'carbon_factor_unit'=> 'kgCO₂e/kg',
             ];
         })->values()->all();
@@ -144,15 +233,17 @@ class EnvironmentalCalculator
             'system_code' => $systemCode,
             'system_name' => (string)($layers->first()->system_name ?? $systemCode),
             'kpi' => [
-                'layer_count'              => (int) $layers->count(),
-                'mass_total_kg_m2'         => $massTotal,
-                'a1a3_total_kgco2e_m2'     => $a1a3Total,
-                'overall_total_kgco2e_m2'  => $a1a3Total, // extend when you add A4
-                'cf_avg_kgco2e_per_kg'     => $cfAvg,
+                'layer_count'              => (int)   $layers->count(),
+                'mass_total_kg_m2'         => (float) $massTotal,
+                'a1a3_total_kgco2e_m2'     => (float) $a1a3Total,
+                'overall_total_kgco2e_m2'  => (float) ($a1a3Total + $a4Total),
+                'cf_avg_kgco2e_per_kg'     => (float) $cfAvg,
             ],
             'layers'     => $prettyLayers,
             'hotspots'   => $hotspots,
             'massSeries' => $massSeries,
         ];
     }
+
+    
 }

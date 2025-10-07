@@ -101,13 +101,13 @@ class SystemCompare extends Component
     {
         $calc = app(EnvironmentalCalculator::class);
 
-        $this->snapA = ($this->systemCodeA)
-            ? $calc->snapshotForSystem($this->datasetVersionId, $this->systemCodeA)
-            : [];
+        $snapA = $calc->snapshotForSystem($this->datasetVersionId, $this->systemCodeA,
+            $this->systemsA[array_key_first(array_filter($this->systemsA, fn($s) => $s['code']===$this->systemCodeA))]['assembly_id'] ?? null
+        );
+        $snapB = $calc->snapshotForSystem($this->datasetVersionId, $this->systemCodeB,
+            $this->systemsB[array_key_first(array_filter($this->systemsB, fn($s) => $s['code']===$this->systemCodeB))]['assembly_id'] ?? null
+        );
 
-        $this->snapB = ($this->systemCodeB)
-            ? $calc->snapshotForSystem($this->datasetVersionId, $this->systemCodeB)
-            : [];
     }
 
     /** Comparison derived metrics for table and charts. */
